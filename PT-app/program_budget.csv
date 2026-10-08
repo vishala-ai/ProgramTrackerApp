@@ -1,0 +1,8 @@
+budget_bucket,component,resources,coverage,allocation_usd,share_pct
+Partner SOW,Implementation partner SOW,Contract,Through program closure and hypercare,6000000,50.00
+In-house resources,Program management / additional engineering,3,Full engagement: 2026-09-20 to 2027-10-31,923077,7.69
+In-house resources,Tech architects,2,Full engagement: 2026-09-20 to 2027-10-31,615385,5.13
+In-house resources,Tech team,2,Full engagement: 2026-09-20 to 2027-10-31,615384,5.13
+In-house resources,Business partners,6,Full engagement: 2026-09-20 to 2027-10-31,1846154,15.39
+Compute and platform support,Compute / GCP platform / support,Operating cost,Full engagement: 2026-09-20 to 2027-10-31,1000000,8.33
+Contingency,Program contingency / management reserve,Reserve,Governance-controlled reserve,1000000,8.33
