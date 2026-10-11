@@ -41,6 +41,11 @@ def normalize_issues(
         parent = fields.get("parent") or {}
         assignee = fields.get("assignee") or {}
         priority = fields.get("priority") or {}
+        labels = fields.get("labels") or []
+        is_simulated = isinstance(labels, list) and any(
+            isinstance(label, str) and label.strip().casefold() == "simulation"
+            for label in labels
+        )
         team_key = _team_value(fields.get(team_field)).lower()
         issue_key = str(issue.get("key", ""))
         rows.append({
@@ -58,6 +63,8 @@ def normalize_issues(
             "epic_key": parent.get("key", ""),
             "assignee": assignee.get("displayName", "Unassigned"),
             "priority": priority.get("name", "Unspecified"),
+            "is_simulated": is_simulated,
+            "story_points": issue.get("_story_points", fields.get("story_points")),
             "created": pd.to_datetime(fields.get("created"), errors="coerce", utc=True),
             "updated": pd.to_datetime(fields.get("updated"), errors="coerce", utc=True),
             "resolved": pd.to_datetime(fields.get("resolutiondate"), errors="coerce", utc=True),
@@ -68,9 +75,15 @@ def normalize_issues(
         })
     columns = [
         "key", "summary", "issue_type", "status", "status_category", "team_key", "team",
-        "epic_key", "assignee", "priority", "created", "updated", "resolved", "due_date", "components", "url", "project_key",
+        "epic_key", "assignee", "priority", "is_simulated", "story_points", "created", "updated", "resolved", "due_date", "components", "url", "project_key",
     ]
-    return pd.DataFrame(rows, columns=columns)
+    normalized = pd.DataFrame(rows, columns=columns)
+    # Missing estimates stay nullable so charts can explain incomplete coverage.
+    estimates = normalized["story_points"].map(lambda value: None if isinstance(value, bool) else value)
+    points = pd.to_numeric(estimates, errors="coerce")
+    points = points.where(points.ge(0) & points.lt(float("inf")))
+    normalized["story_points"] = points.astype("Float64")
+    return normalized
 
 
 def summarize_issues(issues: pd.DataFrame) -> dict[str, int]:
@@ -137,6 +150,133 @@ def load_weekly_snapshots(path: Path) -> pd.DataFrame:
     return snapshots.dropna(subset=["snapshot_date"]).sort_values("snapshot_date").reset_index(drop=True)
 
 
+DAILY_ISSUE_SNAPSHOT_COLUMNS = [
+    "snapshot_date", "key", "summary", "issue_type", "team", "status",
+    "assignee", "priority", "updated", "url",
+]
+DAILY_ISSUE_CHANGE_COLUMNS = [
+    "snapshot_date", "previous_snapshot_date", "key", "summary", "issue_type",
+    "team", "change_type", "details", "status", "assignee", "priority", "updated", "url",
+]
+
+
+def load_daily_issue_snapshots(path: Path) -> pd.DataFrame:
+    """Load issue-level daily snapshots used to show observed Jira changes."""
+    if not path.exists():
+        return pd.DataFrame(columns=DAILY_ISSUE_SNAPSHOT_COLUMNS)
+    snapshots = pd.read_csv(path)
+    if snapshots.empty:
+        return pd.DataFrame(columns=DAILY_ISSUE_SNAPSHOT_COLUMNS)
+    for column in DAILY_ISSUE_SNAPSHOT_COLUMNS:
+        if column not in snapshots.columns:
+            snapshots[column] = ""
+    snapshots["snapshot_date"] = pd.to_datetime(snapshots["snapshot_date"], errors="coerce")
+    snapshots["key"] = snapshots["key"].fillna("").astype(str)
+    snapshots = snapshots.dropna(subset=["snapshot_date"])
+    return snapshots[DAILY_ISSUE_SNAPSHOT_COLUMNS].sort_values(
+        ["snapshot_date", "key"]
+    ).reset_index(drop=True)
+
+
+def record_daily_issue_snapshot(issues: pd.DataFrame, path: Path) -> pd.DataFrame:
+    """Upsert today's Story/Bug statuses and key fields for next-day comparison."""
+    if issues.empty:
+        raise ValueError("Cannot record a daily issue snapshot without Jira issues.")
+    work = issues[issues["issue_type"].fillna("").str.casefold().isin({"story", "bug"})].copy()
+    if work.empty or "key" not in work.columns:
+        raise ValueError("Cannot record a daily issue snapshot without Story/Bug issue keys.")
+
+    snapshot_date = pd.Timestamp.now(tz="America/Los_Angeles").strftime("%Y-%m-%d")
+    current = pd.DataFrame({
+        "snapshot_date": pd.Timestamp(snapshot_date),
+        "key": work["key"].fillna("").astype(str),
+        "summary": work.get("summary", pd.Series("", index=work.index)).fillna("").astype(str),
+        "issue_type": work["issue_type"].fillna("Unknown").astype(str),
+        "team": work.get("team", pd.Series("Unassigned", index=work.index)).fillna("Unassigned").astype(str),
+        "status": work.get("status", pd.Series("Unknown", index=work.index)).fillna("Unknown").astype(str),
+        "assignee": work.get("assignee", pd.Series("Unassigned", index=work.index)).fillna("Unassigned").astype(str),
+        "priority": work.get("priority", pd.Series("Unspecified", index=work.index)).fillna("Unspecified").astype(str),
+        "updated": work.get("updated", pd.Series(pd.NaT, index=work.index)).astype(str),
+        "url": work.get("url", pd.Series("", index=work.index)).fillna("").astype(str),
+    })
+    current = current[current["key"].ne("")].drop_duplicates("key", keep="last")
+
+    snapshots = load_daily_issue_snapshots(path)
+    if not snapshots.empty:
+        snapshots = snapshots[snapshots["snapshot_date"].dt.strftime("%Y-%m-%d") != snapshot_date]
+    snapshots = pd.concat([snapshots, current], ignore_index=True)
+    snapshots = snapshots[DAILY_ISSUE_SNAPSHOT_COLUMNS].sort_values(
+        ["snapshot_date", "key"]
+    ).reset_index(drop=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    snapshots.to_csv(path, index=False)
+    return snapshots
+
+
+def build_daily_issue_changes(snapshots: pd.DataFrame) -> pd.DataFrame:
+    """Compare each saved day with its preceding snapshot; return observable net changes."""
+    if snapshots.empty:
+        return pd.DataFrame(columns=DAILY_ISSUE_CHANGE_COLUMNS)
+    history = snapshots.copy()
+    history["snapshot_date"] = pd.to_datetime(history["snapshot_date"], errors="coerce").dt.normalize()
+    history = history.dropna(subset=["snapshot_date", "key"]).sort_values(["snapshot_date", "key"])
+    dates = sorted(history["snapshot_date"].drop_duplicates())
+    change_rows: list[dict[str, Any]] = []
+    changed_fields = ("team", "assignee", "priority", "issue_type", "summary")
+
+    for previous_date, snapshot_date in zip(dates, dates[1:]):
+        previous = history[history["snapshot_date"] == previous_date].set_index("key", drop=False)
+        current = history[history["snapshot_date"] == snapshot_date].set_index("key", drop=False)
+        previous_keys = set(previous.index)
+        current_keys = set(current.index)
+
+        def add_change(key: str, issue: pd.Series, change_type: str, details: str) -> None:
+            change_rows.append({
+                "snapshot_date": snapshot_date,
+                "previous_snapshot_date": previous_date,
+                "key": key,
+                "summary": issue.get("summary", ""),
+                "issue_type": issue.get("issue_type", "Unknown"),
+                "team": issue.get("team", "Unassigned"),
+                "change_type": change_type,
+                "details": details,
+                "status": issue.get("status", "Unknown"),
+                "assignee": issue.get("assignee", "Unassigned"),
+                "priority": issue.get("priority", "Unspecified"),
+                "updated": issue.get("updated", ""),
+                "url": issue.get("url", ""),
+            })
+
+        for key in sorted(current_keys - previous_keys):
+            issue = current.loc[key]
+            add_change(key, issue, "Added to snapshot", f"Newly present with status {issue.get('status', 'Unknown')}.")
+        for key in sorted(previous_keys - current_keys):
+            issue = previous.loc[key].copy()
+            issue["status"] = "Not in snapshot"
+            add_change(key, issue, "Missing from snapshot", "Not returned in the latest Jira project results.")
+        for key in sorted(previous_keys & current_keys):
+            before = previous.loc[key]
+            after = current.loc[key]
+            details = []
+            if str(before.get("status", "")) != str(after.get("status", "")):
+                details.append(f"Status: {before.get('status', 'Unknown')} → {after.get('status', 'Unknown')}")
+            for field in changed_fields:
+                old_value = str(before.get(field, ""))
+                new_value = str(after.get(field, ""))
+                if old_value != new_value:
+                    label = "Summary" if field == "summary" else field.replace("_", " ").title()
+                    details.append(f"{label}: {old_value or 'blank'} → {new_value or 'blank'}")
+            if details:
+                change_type = "Status moved" if details[0].startswith("Status:") else "Fields updated"
+                add_change(key, after, change_type, "; ".join(details))
+
+    if not change_rows:
+        return pd.DataFrame(columns=DAILY_ISSUE_CHANGE_COLUMNS)
+    return pd.DataFrame(change_rows, columns=DAILY_ISSUE_CHANGE_COLUMNS).sort_values(
+        ["snapshot_date", "change_type", "key"]
+    ).reset_index(drop=True)
+
+
 def build_team_view(
     issues: pd.DataFrame,
     epic_key: str,
@@ -155,14 +295,37 @@ def build_team_view(
     return team_issues
 
 
-TEAM_FLOW_COLUMNS = ["week_start", "team", "status_category", "items"]
+TEAM_FLOW_COLUMNS = ["snapshot_date", "team", "status_category", "items"]
 FLOW_STATUSES = ["To do", "In progress", "Done", "Other"]
 
 
-def record_weekly_team_flow(issues: pd.DataFrame, team_epics: dict[str, tuple[str, str]], path: Path) -> pd.DataFrame:
-    """Upsert this week's team issue counts by status category."""
-    today = pd.Timestamp.now(tz="America/Los_Angeles").normalize()
-    week_start = (today - pd.Timedelta(days=today.weekday())).strftime("%Y-%m-%d")
+def _load_team_flow_file(path: Path, legacy_path: Path | None = None) -> pd.DataFrame:
+    source_path = path if path.exists() else legacy_path
+    if source_path is None or not source_path.exists():
+        return pd.DataFrame(columns=TEAM_FLOW_COLUMNS)
+    snapshots = pd.read_csv(source_path)
+    if "snapshot_date" not in snapshots.columns and "week_start" in snapshots.columns:
+        snapshots = snapshots.rename(columns={"week_start": "snapshot_date"})
+    if snapshots.empty:
+        return pd.DataFrame(columns=TEAM_FLOW_COLUMNS)
+    for column in TEAM_FLOW_COLUMNS:
+        if column not in snapshots.columns:
+            snapshots[column] = pd.NA
+    snapshots["snapshot_date"] = pd.to_datetime(snapshots["snapshot_date"], errors="coerce")
+    snapshots["items"] = pd.to_numeric(snapshots["items"], errors="coerce").fillna(0)
+    return snapshots[TEAM_FLOW_COLUMNS].dropna(subset=["snapshot_date"])
+
+
+def record_daily_team_flow(
+    issues: pd.DataFrame,
+    team_epics: dict[str, tuple[str, str]],
+    path: Path,
+    legacy_path: Path | None = None,
+) -> pd.DataFrame:
+    """Upsert today's per-team status counts for daily cumulative-flow charts."""
+    if issues.empty:
+        raise ValueError("Cannot record a daily team-flow snapshot without Jira issues.")
+    snapshot_date = pd.Timestamp.now(tz="America/Los_Angeles").strftime("%Y-%m-%d")
     rows = []
     for team_label, (epic_key, team_value) in team_epics.items():
         team_frame = build_team_view(issues, epic_key=epic_key, team_value=team_value)
@@ -170,32 +333,35 @@ def record_weekly_team_flow(issues: pd.DataFrame, team_epics: dict[str, tuple[st
         counts = work["status_category"].value_counts()
         for status in FLOW_STATUSES:
             rows.append({
-                "week_start": week_start,
+                "snapshot_date": snapshot_date,
                 "team": team_label,
                 "status_category": status,
                 "items": int(counts.get(status, 0)),
             })
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        snapshots = pd.read_csv(path)
-    else:
-        snapshots = pd.DataFrame(columns=TEAM_FLOW_COLUMNS)
+    snapshots = _load_team_flow_file(path, legacy_path)
     if not snapshots.empty:
-        snapshots = snapshots[snapshots["week_start"].astype(str) != week_start]
+        snapshots = snapshots[snapshots["snapshot_date"].dt.strftime("%Y-%m-%d") != snapshot_date]
     snapshots = pd.concat([snapshots, pd.DataFrame(rows)], ignore_index=True)
-    snapshots = snapshots[TEAM_FLOW_COLUMNS].sort_values(["week_start", "team", "status_category"]).reset_index(drop=True)
+    snapshots = snapshots[TEAM_FLOW_COLUMNS].sort_values(["snapshot_date", "team", "status_category"]).reset_index(drop=True)
     snapshots.to_csv(path, index=False)
     return snapshots
 
 
-def load_weekly_team_flow(path: Path) -> pd.DataFrame:
-    """Load per-team weekly status snapshots for cumulative flow charts."""
-    if not path.exists():
-        return pd.DataFrame(columns=TEAM_FLOW_COLUMNS)
-    snapshots = pd.read_csv(path)
+def load_daily_team_flow(path: Path, legacy_path: Path | None = None) -> pd.DataFrame:
+    """Load daily team status snapshots, migrating older week_start rows in memory."""
+    snapshots = _load_team_flow_file(path, legacy_path)
     if snapshots.empty:
         return pd.DataFrame(columns=TEAM_FLOW_COLUMNS)
-    snapshots["week_start"] = pd.to_datetime(snapshots["week_start"], errors="coerce")
-    snapshots["items"] = pd.to_numeric(snapshots["items"], errors="coerce").fillna(0)
-    return snapshots.dropna(subset=["week_start"]).sort_values(["week_start", "team", "status_category"]).reset_index(drop=True)
+    return snapshots.sort_values(["snapshot_date", "team", "status_category"]).reset_index(drop=True)
+
+
+def record_weekly_team_flow(issues: pd.DataFrame, team_epics: dict[str, tuple[str, str]], path: Path) -> pd.DataFrame:
+    """Backward-compatible alias; snapshots are now recorded daily."""
+    return record_daily_team_flow(issues, team_epics, path)
+
+
+def load_weekly_team_flow(path: Path) -> pd.DataFrame:
+    """Backward-compatible alias for loading daily team-flow snapshots."""
+    return load_daily_team_flow(path)

@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000" viewBox="-32 0 1000 1000">
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#34536b"/></marker></defs>
+<style>text{font-family:Arial,sans-serif;fill:#18374b;text-anchor:middle;font-size:20px}.title{font-size:23px;font-weight:bold}.note{font-size:17px;fill:#34536b}.box{stroke:#537889;stroke-width:2;rx:12}.line{fill:none;stroke:#34536b;stroke-width:2;marker-end:url(#arrow)}.loop{stroke-dasharray:6 5}</style>
+<rect x="-32" width="1000" height="1000" fill="white"/>
+<g fill="#e9f2f8"><rect class="box" x="40" y="30" width="260" height="90"/><rect class="box" x="338" y="30" width="260" height="90"/><rect class="box" x="636" y="30" width="260" height="90"/></g>
+<text class="title" x="170" y="60">Jira KAN</text><text x="170" y="86">Status, priority, estimates</text><text x="170" y="108">Resolution dates</text>
+<text class="title" x="468" y="60">Program files</text><text x="468" y="86">Milestones, budget</text><text x="468" y="108">Recorded actuals</text>
+<text class="title" x="766" y="60">Daily snapshots</text><text x="766" y="86">Issue changes</text><text x="766" y="108">Counts and team flow</text>
+<path class="line" d="M170 120V135H370V155"/><path class="line" d="M468 120V155"/><path class="line" d="M766 120V135H566V155"/>
+<rect class="box" x="210" y="155" width="516" height="70" fill="#dceeea"/>
+<text class="title" x="468" y="184">Normalize data and calculate facts</text><text x="468" y="210">Scope, status, priority, pace, schedule, cost</text>
+<path class="line" d="M330 225V240H170V260"/><path class="line" d="M468 225V260"/><path class="line" d="M606 225V240H766V260"/>
+<g fill="#eef6f3"><rect class="box" x="40" y="260" width="260" height="80"/><rect class="box" x="338" y="260" width="260" height="80"/><rect class="box" x="636" y="260" width="260" height="80"/></g>
+<text class="title" x="170" y="289">Program Summary</text><text x="170" y="314">Priority totals, effort mix</text>
+<text class="title" x="468" y="287">Schedule Deep Dive</text><text x="468" y="311">Full effort and forecast</text><text x="468" y="332">Real-delivery evidence</text>
+<text class="title" x="766" y="287">Budget / workstreams</text><text x="766" y="311">Scoped priority and pace</text><text x="766" y="332">Financial / resource detail</text>
+<path class="line" d="M210 188H20V420H40"/>
+<path class="line" d="M610 225V360H554V390"/>
+<rect class="box" x="40" y="390" width="260" height="80" fill="#eef6f3"/>
+<text class="title" x="170" y="419">Daily Velocity</text><text x="170" y="444">Net changes and trends</text>
+<rect class="box" x="338" y="390" width="260" height="80" fill="#e2eeff"/>
+<text class="title" x="468" y="419">Python simulation</text><text x="468" y="444">Deterministic checks</text>
+<path class="line" d="M400 390V340"/><text class="note" x="490" y="369">Preview: no AI</text>
+<path class="line" d="M598 413H636"/>
+<rect class="box" x="636" y="390" width="260" height="80" fill="#fff1d9"/>
+<text class="title" x="766" y="417">AI forecast critic</text><text x="766" y="442">At most two reviews</text>
+<path class="line loop" d="M766 470V495H554V470"/><text class="note" x="709" y="521">One rerun: double trials, cap 2,000</text>
+<rect class="box" x="338" y="545" width="260" height="80" fill="#e9f2f8"/>
+<text class="title" x="468" y="574">Estimation inputs</text><text x="468" y="599">91% target, capacity, growth</text><path class="line" d="M468 545V470"/>
+<rect class="box" x="40" y="545" width="260" height="80" fill="#f1edf8"/>
+<text class="title" x="170" y="574">Architecture</text><text x="170" y="599">Workflow reference</text>
+<path class="line" d="M20 420V705H40"/><text class="note" x="84" y="683">Facts</text>
+<path class="line" d="M880 470V665"/><text class="note" x="773" y="640">Publish or withhold dates</text>
+<rect class="box" x="40" y="665" width="856" height="80" fill="#eef6f3"/>
+<text class="title" x="468" y="694">Weekly Program Readout</text><text x="468" y="720">Core status, budget, risks + earliest/latest dates and brief assumptions</text>
+<path class="line" d="M468 745V790"/>
+<rect class="box" x="40" y="790" width="856" height="80" fill="#fff1d9"/>
+<text class="title" x="468" y="820">Separate AI commentary loop</text><text x="468" y="847">Draft → review → optional revision → review (four calls maximum)</text>
+<path class="line" d="M468 870V910"/>
+<rect class="box" x="40" y="910" width="856" height="55" fill="#e2eeff"/>
+<text class="title" x="468" y="945">Saved Markdown draft + full forecast JSON for review and replay</text>
+<text class="note" x="468" y="990">Only Jira write path: independent daily simulation → labeled transitions + daily snapshots.</text>
+</svg>

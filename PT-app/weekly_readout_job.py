@@ -22,10 +22,15 @@ from jira_dashboard.client import (  # noqa: E402
     refresh_access_token,
 )
 from jira_dashboard.data import load_weekly_snapshots, normalize_issues, record_weekly_snapshot  # noqa: E402
+from jira_dashboard.delivery import build_delivery_summary  # noqa: E402
+from jira_dashboard.readiness_inputs import load_estimation_inputs  # noqa: E402
+from jira_dashboard.forecast_review import run_estimation_loop  # noqa: E402
+from jira_dashboard.forecast_artifacts import save_forecast_run  # noqa: E402
 from jira_dashboard.readout import (  # noqa: E402
-    OpenAIReadoutError,
+    ReadoutModelError,
     build_weekly_readout,
-    generate_ai_commentary,
+    generate_configured_commentary,
+    make_estimation_reviewer,
 )
 
 TOKEN_FILE = ROOT / "data" / "jira_oauth_token.json"
@@ -35,6 +40,7 @@ ACTUALS_FILE = ROOT / "program_actuals.csv"
 BUDGET_FILE = ROOT / "program_budget.csv"
 READOUTS_DIR = ROOT / "data" / "weekly_readouts"
 SECRETS_FILE = ROOT / ".streamlit" / "secrets.toml"
+ESTIMATION_INPUTS_FILE = ROOT / "data" / "estimation_inputs.json"
 PROJECT_NAME = "TeamVishAI"
 PROGRAM_BUDGET_CAP_USD = 10_000_000
 
@@ -88,8 +94,7 @@ def _program_status(
     today = pd.Timestamp.now(tz="America/Los_Angeles").tz_localize(None).normalize()
     actual_rate = None
     if not issues.empty:
-        work = issues[issues["issue_type"].str.casefold().isin(["story", "bug"])]
-        actual_rate = float(work["resolved"].between(now_utc - pd.Timedelta(days=7), now_utc, inclusive="both").sum())
+        actual_rate = build_delivery_summary(issues, now_utc)["completed_last_7_days"]
 
     active = milestones[(milestones["start_date"] <= today) & (milestones["due_date"] >= today)]
     incomplete = ~milestones["status"].fillna("").str.casefold().isin(
@@ -192,6 +197,23 @@ def run() -> Path:
     )
     generated_at = pd.Timestamp.now(tz="UTC")
     project_key = str(jira_config.get("project_key", "KAN")).strip().upper()
+    ai_config = dict(settings.get("ai", {}))
+    openai_config = dict(settings.get("openai", {}))
+    provider = str(ai_config.get("provider", "ollama")).strip().casefold() or "ollama"
+    if provider == "openai":
+        model = str(ai_config.get("model", openai_config.get("model", "gpt-6-luna"))).strip() or "gpt-6-luna"
+    else:
+        model = str(ai_config.get("model", "llama3.2")).strip() or "llama3.2"
+    api_key = str(openai_config.get("api_key", "")).strip()
+    base_url = str(ai_config.get("base_url", "http://localhost:11434")).strip().rstrip("/")
+    estimation_inputs = load_estimation_inputs(ESTIMATION_INPUTS_FILE, project_key=project_key)
+    forecast = run_estimation_loop(
+        issues, milestones, generated_at, estimation_inputs=estimation_inputs,
+        reviewer=make_estimation_reviewer(provider, model, api_key=api_key, base_url=base_url),
+    )
+    logging.info("Simulated forecast: %s; deterministic checks: %s; AI review: %s; run: %s.",
+                 forecast.get("status"), forecast["deterministic_validation"]["status"],
+                 forecast["review"]["status"], forecast["run_id"])
     report = build_weekly_readout(
         project_name=PROJECT_NAME,
         project_key=project_key,
@@ -207,26 +229,38 @@ def run() -> Path:
         cost_status=cost,
         planned_rate=planned_rate,
         actual_rate=actual_rate,
+        estimation_inputs=estimation_inputs,
+        estimation_forecast=forecast,
     )
-    openai_config = dict(settings.get("openai", {}))
-    api_key = str(openai_config.get("api_key", "")).strip()
-    model = str(openai_config.get("model", "gpt-6-luna")).strip() or "gpt-6-luna"
-    if api_key:
-        try:
-            commentary = generate_ai_commentary(api_key, model, report)
-            report = report.replace(
-                "## Executive status",
-                f"## AI-generated executive commentary\n\n{commentary}\n\n## Executive status",
-                1,
-            )
-        except OpenAIReadoutError as exc:
-            logging.warning("AI commentary unavailable; saving the deterministic report: %s", exc)
-    else:
-        logging.info("No OpenAI key configured; saving the deterministic report only.")
+    try:
+        commentary_result = generate_configured_commentary(
+            provider,
+            model,
+            report,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        report = report.replace(
+            "## Executive status",
+            f"## AI-reviewed executive commentary ({provider}: {model})\n\n"
+            f"*Coverage/risk checks: {commentary_result.review_passes}; "
+            f"revisions: {commentary_result.revisions}.*\n\n"
+            f"{commentary_result.text}\n\n## Executive status",
+            1,
+        )
+        logging.info(
+            "AI commentary passed coverage/risk review (%s review pass(es), %s revision(s)).",
+            commentary_result.review_passes,
+            commentary_result.revisions,
+        )
+    except ReadoutModelError as exc:
+        logging.warning("Model commentary unavailable; saving the deterministic report: %s", exc)
 
     READOUTS_DIR.mkdir(parents=True, exist_ok=True)
     path = READOUTS_DIR / f"weekly_readout_{generated_at.tz_convert('America/Los_Angeles'):%Y%m%d_%H%M%S}.md"
     path.write_text(report, encoding="utf-8")
+    save_forecast_run(path.with_suffix(".forecast.json"), forecast, issues=issues,
+                      milestones=milestones, now=generated_at, estimation_inputs=estimation_inputs)
     return path
 
 

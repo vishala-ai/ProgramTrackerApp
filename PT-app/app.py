@@ -9,7 +9,7 @@ import hmac
 import json
 import os
 import time
-from datetime import date
+from datetime import date, timedelta
 from html import escape as html_escape
 from pathlib import Path
 from textwrap import dedent
@@ -27,15 +27,27 @@ from jira_dashboard.client import (
     refresh_access_token,
 )
 from jira_dashboard.data import (
+    build_daily_issue_changes,
     build_team_view,
+    load_daily_issue_snapshots,
+    load_daily_team_flow,
     load_weekly_snapshots,
-    load_weekly_team_flow,
     normalize_issues,
+    record_daily_issue_snapshot,
+    record_daily_team_flow,
     record_weekly_snapshot,
-    record_weekly_team_flow,
     summarize_issues,
 )
-from jira_dashboard.readout import OpenAIReadoutError, build_weekly_readout, generate_ai_commentary
+from jira_dashboard.readout import ReadoutModelError, build_weekly_readout, generate_configured_commentary, make_estimation_reviewer
+from jira_dashboard.priority import PRIORITY_ORDER, STATUS_COLORS, STATUS_ORDER, priority_status_summary, story_point_distribution
+from jira_dashboard.delivery_views import render_delivery_views
+from jira_dashboard.delivery import build_delivery_summary
+from jira_dashboard.readiness import assess_estimation_readiness
+from jira_dashboard.readiness_inputs import load_estimation_inputs
+from jira_dashboard.readiness_views import render_estimation_readiness
+from jira_dashboard.forecast_review import run_estimation_loop
+from jira_dashboard.forecast_views import render_estimation_forecast, render_forecast_summary
+from jira_dashboard.forecast_artifacts import save_forecast_run
 
 ROOT = Path(__file__).resolve().parent
 TOKEN_CACHE_FILE = ROOT / "data" / "jira_oauth_token.json"
@@ -43,14 +55,24 @@ MILESTONES_FILE = ROOT / "milestones.csv"
 SUMMARY_FILE = ROOT / "executive_summary.md"
 SNAPSHOTS_FILE = ROOT / "data" / "weekly_work_snapshots.csv"
 TEAM_FLOW_SNAPSHOTS_FILE = ROOT / "data" / "weekly_team_flow_snapshots.csv"
+DAILY_TEAM_FLOW_SNAPSHOTS_FILE = ROOT / "data" / "daily_team_flow_snapshots.csv"
+DAILY_ISSUE_SNAPSHOTS_FILE = ROOT / "data" / "daily_issue_status_snapshots.csv"
 READOUTS_DIR = ROOT / "data" / "weekly_readouts"
+ESTIMATION_INPUTS_FILE = ROOT / "data" / "estimation_inputs.json"
+AI_CONFIG = {}
 OPENAI_CONFIG = {}
 try:
+    AI_CONFIG = dict(st.secrets.get("ai", {}))
     OPENAI_CONFIG = dict(st.secrets.get("openai", {}))
 except Exception:
     pass
 OPENAI_API_KEY = str(OPENAI_CONFIG.get("api_key", "")).strip()
-OPENAI_MODEL = str(OPENAI_CONFIG.get("model", "gpt-6-luna")).strip() or "gpt-6-luna"
+AI_PROVIDER = str(AI_CONFIG.get("provider", "ollama")).strip().casefold() or "ollama"
+if AI_PROVIDER == "openai":
+    AI_MODEL = str(AI_CONFIG.get("model", OPENAI_CONFIG.get("model", "gpt-6-luna"))).strip() or "gpt-6-luna"
+else:
+    AI_MODEL = str(AI_CONFIG.get("model", "llama3.2")).strip() or "llama3.2"
+OLLAMA_BASE_URL = str(AI_CONFIG.get("base_url", "http://localhost:11434")).strip().rstrip("/")
 ACTUALS_FILE = ROOT / "program_actuals.csv"
 BUDGET_FILE = ROOT / "program_budget.csv"
 PROGRAM_BUDGET_CAP_USD = 10_000_000
@@ -86,7 +108,11 @@ def read_jira_config() -> dict:
 
 
 def clear_connection() -> None:
-    for key in ("jira_token", "jira_sites", "jira_issues", "jira_last_sync", "jira_oauth_state"):
+    for key in (
+        "jira_token", "jira_sites", "jira_issues", "jira_last_sync", "jira_oauth_state",
+        "_dashboard_source_mtimes_seen", "_jira_auto_refresh_pending", "_jira_initial_refresh_attempted",
+        "_local_source_refresh_notice",
+    ):
         st.session_state.pop(key, None)
     try:
         TOKEN_CACHE_FILE.unlink(missing_ok=True)
@@ -118,6 +144,26 @@ def load_oauth_token() -> dict | None:
     if not isinstance(token, dict) or not token.get("refresh_token"):
         return None
     return token
+
+
+def dashboard_source_mtimes() -> dict[str, float]:
+    source_paths = {
+        "Jira backlog snapshot": SNAPSHOTS_FILE,
+        "Daily team snapshot": DAILY_TEAM_FLOW_SNAPSHOTS_FILE,
+        "Daily issue snapshot": DAILY_ISSUE_SNAPSHOTS_FILE,
+        "milestones.csv": MILESTONES_FILE,
+        "program_budget.csv": BUDGET_FILE,
+        "program_actuals.csv": ACTUALS_FILE,
+        "executive_summary.md": SUMMARY_FILE,
+        "Estimation inputs": ESTIMATION_INPUTS_FILE,
+    }
+    mtimes = {}
+    for label, path in source_paths.items():
+        try:
+            mtimes[label] = path.stat().st_mtime
+        except OSError:
+            mtimes[label] = 0.0
+    return mtimes
 
 
 def create_oauth_state(signing_secret: str) -> str:
@@ -230,6 +276,54 @@ if token and "jira_sites" not in st.session_state:
         st.warning(f"The saved Jira connection could not be restored; reconnect to continue. ({exc})")
 
 
+@st.fragment(run_every="60s")
+def watch_for_dashboard_sources() -> None:
+    """Rerun after local inputs change; refetch Jira when its saved snapshots change."""
+    current_mtimes = dashboard_source_mtimes()
+    seen_mtimes = st.session_state.get("_dashboard_source_mtimes_seen")
+    jira_snapshot_labels = {"Jira backlog snapshot", "Daily team snapshot"}
+
+    if seen_mtimes is None:
+        st.session_state["_dashboard_source_mtimes_seen"] = current_mtimes
+        # Detect a simulator snapshot created after this session's last Jira fetch,
+        # including the case where Streamlit reloads the app but preserves session state.
+        last_sync = st.session_state.get("jira_last_sync")
+        if last_sync is not None:
+            try:
+                sync_time = pd.Timestamp(last_sync)
+                if sync_time.tzinfo is None:
+                    sync_time = sync_time.tz_localize("UTC")
+                newer_jira_snapshot = any(
+                    current_mtimes[label] > sync_time.timestamp() + 1
+                    for label in jira_snapshot_labels
+                )
+                if newer_jira_snapshot:
+                    st.session_state["_jira_auto_refresh_pending"] = True
+                    st.session_state["_local_source_refresh_notice"] = "Jira snapshot files"
+                    st.rerun()
+            except (TypeError, ValueError):
+                pass
+        return
+
+    changed_sources = [
+        label
+        for label, current_mtime in current_mtimes.items()
+        if abs(current_mtime - float(seen_mtimes.get(label, 0.0))) > 0.01
+    ]
+    if not changed_sources:
+        return
+
+    # Store the new baseline before rerunning so the same file change does not loop.
+    st.session_state["_dashboard_source_mtimes_seen"] = current_mtimes
+    if jira_snapshot_labels.intersection(changed_sources) and st.session_state.get("jira_token"):
+        st.session_state["_jira_auto_refresh_pending"] = True
+    st.session_state["_local_source_refresh_notice"] = ", ".join(changed_sources)
+    st.rerun()
+
+
+watch_for_dashboard_sources()
+
+
 with st.sidebar:
     st.header("Jira connection")
     st.caption(f"{PROJECT_NAME} · {configured_project}")
@@ -243,12 +337,30 @@ with st.sidebar:
             selected_resource = next((site for site in sites if site.get("url", "").rstrip("/") == selected_site.rstrip("/")), None)
         else:
             selected_resource = None
-        if st.button("Refresh from Jira", type="primary", use_container_width=True):
+        initial_refresh_due = (
+            not st.session_state.get("_jira_initial_refresh_attempted", False)
+            and ("jira_issues" not in st.session_state or st.session_state.get("jira_last_sync") is None)
+        )
+        if initial_refresh_due:
+            st.session_state["_jira_initial_refresh_attempted"] = True
+        automatic_refresh_due = bool(st.session_state.pop("_jira_auto_refresh_pending", False))
+        manual_refresh_requested = st.button(
+            "Refresh from Jira",
+            type="primary",
+            use_container_width=True,
+            key="refresh-jira-project",
+        )
+        if manual_refresh_requested or initial_refresh_due or automatic_refresh_due:
             if not selected_resource:
                 st.error("No accessible Jira site was returned for this account.")
             else:
                 try:
-                    with st.spinner("Loading KAN issues and saving today's trend point…"):
+                    spinner_message = (
+                        "Refreshing Jira after the daily simulation…"
+                        if automatic_refresh_due
+                        else "Loading KAN issues and saving today's trend point…"
+                    )
+                    with st.spinner(spinner_message):
                         fetched_issues = fetch_project_issues(
                             access_token=st.session_state["jira_token"]["access_token"],
                             cloud_id=selected_resource["id"],
@@ -261,15 +373,28 @@ with st.sidebar:
                             project_key=configured_project,
                         )
                         weekly_snapshots = record_weekly_snapshot(normalized_fetched, SNAPSHOTS_FILE)
-                        record_weekly_team_flow(normalized_fetched, TEAM_EPICS, TEAM_FLOW_SNAPSHOTS_FILE)
+                        record_daily_issue_snapshot(normalized_fetched, DAILY_ISSUE_SNAPSHOTS_FILE)
+                        record_daily_team_flow(
+                            normalized_fetched,
+                            TEAM_EPICS,
+                            DAILY_TEAM_FLOW_SNAPSHOTS_FILE,
+                            legacy_path=TEAM_FLOW_SNAPSHOTS_FILE,
+                        )
                         st.session_state["jira_issues"] = fetched_issues
                         st.session_state["jira_last_sync"] = pd.Timestamp.now(tz="UTC")
-                    st.success(f"Loaded {len(fetched_issues):,} Jira issues and saved the daily trend point for {str(weekly_snapshots.iloc[-1]['snapshot_date'])[:10]}.")
+                        st.session_state["_dashboard_source_mtimes_seen"] = dashboard_source_mtimes()
+                    if automatic_refresh_due:
+                        st.success("Dashboard refreshed from Jira after the simulation snapshot.")
+                    elif initial_refresh_due:
+                        st.success("Loaded the latest Jira items for this dashboard session.")
+                    else:
+                        st.success(f"Loaded {len(fetched_issues):,} Jira issues and saved the daily trend point for {str(weekly_snapshots.iloc[-1]['snapshot_date'])[:10]}.")
                 except (JiraAPIError, OSError, ValueError) as exc:
                     st.error(f"Could not load Jira project data: {exc}")
         if st.session_state.get("jira_last_sync") is not None:
             sync_time = st.session_state["jira_last_sync"].tz_convert("America/Los_Angeles")
             st.caption(f"Last refresh: {sync_time:%b %d, %Y %I:%M %p} PT")
+        st.caption("Checks saved Jira snapshots and local program files every minute while this page is open. Other live Jira edits need a manual refresh.")
         if st.button("Disconnect", use_container_width=True):
             clear_connection()
             st.rerun()
@@ -288,6 +413,9 @@ with st.sidebar:
             )
             st.link_button("Connect to Jira", url, type="primary", use_container_width=True)
             st.caption("Read-only Jira access is requested. After authorizing, return here and choose **Refresh from Jira**.")
+    source_refresh_notice = st.session_state.pop("_local_source_refresh_notice", None)
+    if source_refresh_notice:
+        st.caption(f"Detected source changes and refreshed the dashboard: {source_refresh_notice}.")
 
 st.divider()
 
@@ -348,11 +476,309 @@ else:
 
 raw_issues = st.session_state.get("jira_issues", [])
 issues = normalize_issues(raw_issues, team_field=team_field, project_key=configured_project)
-weekly_snapshots = load_weekly_snapshots(SNAPSHOTS_FILE)
-weekly_team_flow = load_weekly_team_flow(TEAM_FLOW_SNAPSHOTS_FILE)
-summary = summarize_issues(issues)
-tabs = st.tabs(["Program Summary", "Weekly Readout", "Schedule Deep Dive", "Budget Breakdown", "Finance & Accounting", "Credit", "Collections", "Architecture"])
+delivery_now = pd.Timestamp(st.session_state.get("jira_last_sync") or pd.Timestamp.now(tz="UTC"))
+if delivery_now.tzinfo is None:
+    delivery_now = delivery_now.tz_localize("UTC")
+delivery_as_of = delivery_now.tz_convert("America/Los_Angeles").strftime("%b %d, %Y %I:%M %p PT")
+delivery_dates_available = any("resolutiondate" in issue.get("fields", {}) for issue in raw_issues)
+estimation_inputs = load_estimation_inputs(ESTIMATION_INPUTS_FILE, project_key=configured_project)
+estimation_readiness = assess_estimation_readiness(
+    issues, milestones, delivery_now, project_key=configured_project,
+    data_mode=estimation_inputs["data_mode"], confirmations=estimation_inputs["confirmations"],
+)
 
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def preview_estimation_forecast(issue_data, milestone_data, as_of, inputs):
+    """Cache the pure Python preview; ordinary page rendering never calls AI."""
+    return run_estimation_loop(issue_data, milestone_data, as_of, estimation_inputs=inputs)
+
+
+estimation_forecast = preview_estimation_forecast(issues, milestones, delivery_now, estimation_inputs)
+weekly_snapshots = load_weekly_snapshots(SNAPSHOTS_FILE)
+daily_team_flow = load_daily_team_flow(
+    DAILY_TEAM_FLOW_SNAPSHOTS_FILE,
+    legacy_path=TEAM_FLOW_SNAPSHOTS_FILE,
+)
+summary = summarize_issues(issues)
+tabs = st.tabs(["Program Summary", "Schedule Deep Dive", "Budget Breakdown", "Finance & Accounting", "Credit", "Collections", "Architecture", "Other Reports"])
+
+
+BACKLOG_STATUS_CATEGORIES = ["To do", "In progress", "Done", "Other"]
+
+
+def build_daily_backlog_history() -> pd.DataFrame:
+    """Aggregate team snapshots into program history when they cover the full KAN scope."""
+    columns = ["snapshot_date", "status_category", "items"]
+    if daily_team_flow.empty or weekly_snapshots.empty:
+        return pd.DataFrame(columns=columns)
+
+    history = daily_team_flow.copy()
+    history["snapshot_date"] = pd.to_datetime(history["snapshot_date"], errors="coerce").dt.normalize()
+    history = history.dropna(subset=["snapshot_date"])
+    history = history.groupby(["snapshot_date", "status_category"], as_index=False)["items"].sum()
+    flow_totals = history.groupby("snapshot_date")["items"].sum()
+
+    scope = weekly_snapshots.copy()
+    scope["snapshot_date"] = pd.to_datetime(scope["snapshot_date"], errors="coerce").dt.normalize()
+    scope["scope_total"] = scope["open_items"] + scope["completed_items"]
+    scope_by_date = scope.dropna(subset=["snapshot_date"]).set_index("snapshot_date")["scope_total"]
+    covered_dates = [
+        snapshot_date for snapshot_date, total in flow_totals.items()
+        if snapshot_date in scope_by_date.index and int(total) == int(scope_by_date.loc[snapshot_date])
+    ]
+    return history[history["snapshot_date"].isin(covered_dates)][columns].sort_values(
+        ["snapshot_date", "status_category"]
+    ).reset_index(drop=True)
+
+
+def render_daily_velocity_page() -> None:
+    st.header("Daily Velocity")
+    st.caption(
+        "Actor-neutral view of the KAN Story and Bug backlog. It shows each item's Jira status at the snapshot time, "
+        "regardless of who changed it."
+    )
+
+    status_history = build_daily_backlog_history()
+    work = (
+        issues[issues["issue_type"].str.casefold().isin({"story", "bug"})]
+        if not issues.empty
+        else issues
+    )
+    if not work.empty:
+        status_counts = work["status_category"].value_counts()
+        current_counts = {status: int(status_counts.get(status, 0)) for status in BACKLOG_STATUS_CATEGORIES}
+        current_total = len(work)
+        last_sync = st.session_state.get("jira_last_sync")
+        if last_sync is not None:
+            try:
+                sync_time = pd.Timestamp(last_sync)
+                if sync_time.tzinfo is None:
+                    sync_time = sync_time.tz_localize("UTC")
+                status_as_of = sync_time.tz_convert("America/Los_Angeles").strftime("%b %d, %Y %I:%M %p PT")
+            except (TypeError, ValueError):
+                status_as_of = "latest Jira refresh"
+        else:
+            status_as_of = "latest Jira refresh"
+    elif not status_history.empty:
+        latest_date = status_history["snapshot_date"].max()
+        latest = status_history[status_history["snapshot_date"] == latest_date]
+        status_counts = latest.set_index("status_category")["items"]
+        current_counts = {status: int(status_counts.get(status, 0)) for status in BACKLOG_STATUS_CATEGORIES}
+        current_total = sum(current_counts.values())
+        status_as_of = pd.Timestamp(latest_date).strftime("%b %d, %Y") + " snapshot"
+    else:
+        st.info("Refresh KAN from Jira to show the current backlog status and start its daily history.")
+        return
+
+    metrics = st.columns(5)
+    metrics[0].metric("Story + Bug scope", f"{current_total:,}", f"As of {status_as_of}")
+    metrics[1].metric("To do", f"{current_counts['To do']:,}")
+    metrics[2].metric("In progress", f"{current_counts['In progress']:,}")
+    metrics[3].metric("Done", f"{current_counts['Done']:,}")
+    metrics[4].metric("Other", f"{current_counts['Other']:,}")
+
+    current_chart_data = pd.DataFrame({"Status": BACKLOG_STATUS_CATEGORIES, "Items": [current_counts[s] for s in BACKLOG_STATUS_CATEGORIES]})
+    current_chart = px.bar(
+        current_chart_data,
+        x="Status",
+        y="Items",
+        color="Status",
+        title="Current KAN backlog by Jira status",
+        category_orders={"Status": BACKLOG_STATUS_CATEGORIES},
+        color_discrete_map={"To do": "#E4A23A", "In progress": "#3B82F6", "Done": "#33A06F", "Other": "#999999"},
+    )
+    current_chart.update_layout(margin=dict(t=55, b=25, l=10, r=10), showlegend=False, yaxis_title="Stories and bugs")
+    st.plotly_chart(current_chart, use_container_width=True, key="daily-velocity-current-status")
+
+    render_delivery_views(
+        work, key_prefix="daily-delivery", as_of=delivery_as_of,
+        resolution_dates_available=delivery_dates_available, now=delivery_now,
+        scope_note="Current KAN Stories and Bugs. Daily snapshot changes below show net movement, not every Jira event.",
+    )
+
+    st.subheader("Daily change snapshot")
+    st.caption(
+        "Shows net issue changes observed between daily Jira snapshots, regardless of who made them. "
+        "Changes made and reversed between snapshots may not appear."
+    )
+    issue_snapshots = load_daily_issue_snapshots(DAILY_ISSUE_SNAPSHOTS_FILE)
+    snapshot_dates = [
+        pd.Timestamp(value)
+        for value in sorted(issue_snapshots["snapshot_date"].dropna().dt.normalize().unique())
+    ]
+    if len(snapshot_dates) < 2:
+        st.info(
+            "The first issue-level snapshot is the baseline. After the next daily simulation run "
+            "or successful Jira refresh, this section will list the issues and fields that changed."
+        )
+    else:
+        changes = build_daily_issue_changes(issue_snapshots)
+        comparison_dates = snapshot_dates[1:]
+        selected_change_date = st.selectbox(
+            "Snapshot day",
+            options=comparison_dates,
+            index=len(comparison_dates) - 1,
+            format_func=lambda value: pd.Timestamp(value).strftime("%b %d, %Y"),
+            key="daily-velocity-change-date",
+        )
+        date_index = snapshot_dates.index(selected_change_date)
+        prior_date = snapshot_dates[date_index - 1]
+        st.caption(
+            f"Comparing {pd.Timestamp(prior_date):%b %d} with "
+            f"{pd.Timestamp(selected_change_date):%b %d, %Y}."
+        )
+        day_changes = changes[changes["snapshot_date"].eq(selected_change_date)].copy()
+        if day_changes.empty:
+            st.info("No net story or bug changes were observed between these snapshots.")
+        else:
+            change_metrics = st.columns(4)
+            change_metrics[0].metric(
+                "Status movements", int(day_changes["change_type"].eq("Status moved").sum()),
+                help='Existing items whose status changed between the selected day and the previous saved snapshot. Each item counts once, even if its other details also changed. This shows net changes, not every Jira event.',
+            )
+            change_metrics[1].metric(
+                "Added to snapshot", int(day_changes["change_type"].eq("Added to snapshot").sum()),
+                help='Items included on the selected day that were absent from the previous saved snapshot. These may be new Jira issues or existing issues newly included in the tracked scope; moving an existing item to In Progress does not add it here.',
+            )
+            change_metrics[2].metric(
+                "Field updates", int(day_changes["change_type"].eq("Fields updated").sum()),
+                help='Existing items whose assignee, priority, team, summary, or issue type changed while their status stayed the same. Each item counts once. Items that also changed status are counted under Status movements instead.',
+            )
+            change_metrics[3].metric(
+                "Missing from snapshot", int(day_changes["change_type"].eq("Missing from snapshot").sum()),
+                help='Items present in the previous saved snapshot but absent on the selected day. They may have moved outside the tracked scope or no longer be returned by Jira; this does not necessarily mean they were deleted.',
+            )
+            priority_changes = day_changes[
+                day_changes["details"].str.contains("Priority:", regex=False, na=False)
+            ]
+            with st.expander(f"Priority changes on this day ({len(priority_changes):,} items)"):
+                if priority_changes.empty:
+                    st.caption("No net priority changes were recorded between these two snapshots.")
+                else:
+                    st.dataframe(
+                        priority_changes[["url", "key", "summary", "team", "details", "priority"]].rename(
+                            columns={"url": "Jira", "key": "Issue", "summary": "Summary", "team": "Team",
+                                     "details": "Changes", "priority": "Current priority"}
+                        ),
+                        use_container_width=True, hide_index=True,
+                        column_config={"Jira": st.column_config.LinkColumn("Jira", display_text="Open")},
+                    )
+            change_view = day_changes.rename(columns={
+                "url": "Issue",
+                "summary": "Summary",
+                "issue_type": "Type",
+                "team": "Team",
+                "change_type": "Change",
+                "details": "Details",
+                "status": "Current status",
+                "assignee": "Assignee",
+                "priority": "Priority",
+                "updated": "Jira updated",
+            })
+            columns = [
+                "Issue", "Summary", "Type", "Team", "Change", "Details",
+                "Current status", "Assignee", "Priority", "Jira updated",
+            ]
+            change_view["Jira updated"] = pd.to_datetime(
+                change_view["Jira updated"], errors="coerce", utc=True
+            ).dt.tz_convert("America/Los_Angeles").dt.strftime("%b %d, %Y %I:%M %p PT")
+            st.dataframe(
+                change_view[columns],
+                use_container_width=True,
+                hide_index=True,
+                column_config={"Issue": st.column_config.LinkColumn("Jira", display_text="Open")},
+            )
+
+    st.subheader("Daily backlog status trend")
+    st.caption("Daily snapshots record current Jira status counts. Net change compares each snapshot with the preceding one; it does not attribute updates to a person.")
+    if status_history.empty:
+        st.info("Daily status history will appear after the next Jira refresh or simulator snapshot.")
+        return
+
+    dates = sorted(status_history["snapshot_date"].dropna().unique())
+    first_snapshot_date = pd.Timestamp(dates[0]).date()
+    last_snapshot_date = pd.Timestamp(dates[-1]).date()
+    today_pt = pd.Timestamp.now(tz="America/Los_Angeles").date()
+    default_end = today_pt
+    default_start = default_end - timedelta(days=9)
+    selected_dates = st.date_input(
+        "Snapshot range",
+        value=(default_start, default_end),
+        min_value=min(first_snapshot_date, default_start),
+        max_value=max(last_snapshot_date, default_end),
+        key="daily-velocity-status-range",
+    )
+    if not isinstance(selected_dates, (tuple, list)) or len(selected_dates) != 2:
+        st.info("Select a start and end date to view the snapshot trend.")
+        return
+    start_date = pd.Timestamp(selected_dates[0])
+    end_date = pd.Timestamp(selected_dates[1])
+    if start_date > end_date:
+        st.warning("The snapshot start date must be on or before the end date.")
+        return
+    visible_history = status_history[
+        status_history["snapshot_date"].between(start_date, end_date, inclusive="both")
+    ]
+    if visible_history.empty:
+        st.info("No status snapshots were recorded in this date range.")
+        return
+
+    st.caption(
+        f"{visible_history['snapshot_date'].nunique()} snapshot day(s) recorded in this range. "
+        "Dates without a snapshot appear as gaps."
+    )
+    snapshot_pivot = visible_history.pivot_table(
+        index="snapshot_date", columns="status_category", values="items", aggfunc="sum"
+    ).reindex(columns=BACKLOG_STATUS_CATEGORIES).sort_index()
+    calendar = pd.date_range(start_date, end_date, freq="D")
+    chart_pivot = snapshot_pivot.reindex(calendar)
+    chart_pivot.index.name = "snapshot_date"
+    chart_history = chart_pivot.reset_index().melt(
+        id_vars="snapshot_date", var_name="status_category", value_name="items"
+    )
+
+    flow_chart = px.line(
+        chart_history,
+        x="snapshot_date",
+        y="items",
+        color="status_category",
+        markers=True,
+        title="Daily KAN backlog status snapshots",
+        labels={"snapshot_date": "Snapshot date", "items": "Stories and bugs", "status_category": "Jira status"},
+        category_orders={"status_category": BACKLOG_STATUS_CATEGORIES},
+        color_discrete_map={"To do": "#E4A23A", "In progress": "#3B82F6", "Done": "#33A06F", "Other": "#999999"},
+    )
+    flow_chart.update_layout(margin=dict(t=55, b=25, l=10, r=10), legend_title_text="Jira status")
+    flow_chart.update_xaxes(title="Snapshot date", tickformat="%b %d", range=[start_date, end_date])
+    st.plotly_chart(flow_chart, use_container_width=True, key="daily-velocity-status-trend")
+
+    if visible_history["snapshot_date"].nunique() > 1:
+        full_pivot = status_history.pivot_table(
+            index="snapshot_date", columns="status_category", values="items", aggfunc="sum"
+        ).reindex(columns=BACKLOG_STATUS_CATEGORIES, fill_value=0).sort_index()
+        net_change = full_pivot.diff()
+        net_change = net_change.loc[
+            net_change.index.to_series().between(start_date, end_date, inclusive="both")
+        ].dropna().rename_axis("snapshot_date").reset_index()
+        if not net_change.empty:
+            net_change = net_change.melt(
+                id_vars="snapshot_date", var_name="status_category", value_name="net_change"
+            )
+            change_chart = px.bar(
+                net_change,
+                x="snapshot_date",
+                y="net_change",
+                color="status_category",
+                barmode="relative",
+                title="Net backlog change since prior snapshot",
+                labels={"snapshot_date": "Snapshot date", "net_change": "Net item change", "status_category": "Jira status"},
+                category_orders={"status_category": BACKLOG_STATUS_CATEGORIES},
+                color_discrete_map={"To do": "#E4A23A", "In progress": "#3B82F6", "Done": "#33A06F", "Other": "#999999"},
+            )
+            change_chart.update_layout(margin=dict(t=55, b=25, l=10, r=10), legend_title_text="Jira status")
+            change_chart.update_xaxes(title="Snapshot date", tickformat="%b %d", range=[start_date, end_date])
+            st.plotly_chart(change_chart, use_container_width=True, key="daily-velocity-status-change")
 
 def render_issue_table(frame: pd.DataFrame) -> None:
     if frame.empty:
@@ -412,6 +838,60 @@ def render_priority_chart(frame: pd.DataFrame, title: str) -> None:
     fig = px.bar(counts, x="priority", y="Count", color="issue_type", barmode="group", title=title)
     fig.update_layout(margin=dict(t=50, b=10, l=10, r=10), legend_title_text="Work item")
     st.plotly_chart(fig, use_container_width=True)
+
+
+def render_program_priority_status(frame: pd.DataFrame, as_of: str) -> None:
+    st.subheader("Priority and effort overview")
+    st.caption(f"Current Stories and Bugs, including completed work · Data as of {as_of}.")
+    summary = priority_status_summary(frame)
+    if summary.empty:
+        st.info("Refresh Jira to show status by priority. Aggregate snapshots do not contain priorities or story points.")
+        return
+    priority_order = [value for value in PRIORITY_ORDER if value != "Unspecified"]
+    priority_order += sorted(set(summary["priority"]) - set(PRIORITY_ORDER))
+    priority_order.append("Unspecified")
+    item_col, effort_col = st.columns(2)
+    with item_col:
+        chart = px.bar(
+            summary, x="priority", y="items", color="status_category", barmode="stack",
+            title="Status by priority · item count", color_discrete_map=STATUS_COLORS,
+            category_orders={"priority": priority_order, "status_category": STATUS_ORDER},
+            labels={"priority": "Priority", "items": "Items", "status_category": "Status"},
+        )
+        chart.update_layout(height=320, margin=dict(t=50, b=15, l=5, r=10),
+                            legend=dict(orientation="h", y=-0.25))
+        priority_totals = summary.groupby("priority", sort=False)["items"].sum()
+        for priority, total in priority_totals.items():
+            chart.add_annotation(
+                x=priority, y=int(total), text=f"{total:,}", showarrow=False,
+                yanchor="bottom", yshift=4, font=dict(size=13, color="#172033"),
+            )
+        chart.update_yaxes(
+            range=[0, priority_totals.max() * 1.18],
+            dtick=1 if priority_totals.max() < 10 else None,
+        )
+        st.plotly_chart(chart, use_container_width=True, key="program-priority-items")
+    with effort_col:
+        distribution = story_point_distribution(frame)
+        if distribution.empty:
+            st.markdown("**Complexity/Effort view**")
+            st.info("No Stories are available to show the effort distribution.")
+        else:
+            chart = px.pie(
+                distribution, names="story_point_estimate", values="stories",
+                title="Complexity/Effort view", color="story_point_estimate",
+                color_discrete_sequence=px.colors.qualitative.Plotly,
+                color_discrete_map={"Not estimated": "#94A3B8"},
+                labels={"story_point_estimate": "Story-point estimate", "stories": "Stories"},
+            )
+            chart.update_traces(
+                sort=False, textinfo="label+value",
+                hovertemplate="%{label}<br>%{value:,.0f} Stories (%{percent})<extra></extra>",
+            )
+            chart.update_layout(height=320, margin=dict(t=50, b=15, l=5, r=10), showlegend=False)
+            st.plotly_chart(chart, use_container_width=True, key="program-story-effort")
+            st.caption("Story counts by story-point estimate, including completed Stories. "
+                       "Missing estimates appear as Not estimated. Story points describe estimated effort, not elapsed time.")
 
 
 def render_work_trend_chart(snapshots: pd.DataFrame) -> None:
@@ -544,19 +1024,19 @@ def render_resource_work_mapping(frame: pd.DataFrame, team_label: str) -> None:
 
 
 def render_team_cumulative_flow(team_label: str, snapshots: pd.DataFrame) -> None:
-    """Show weekly story and bug counts split by Jira status category."""
+    """Show daily story and bug counts split by Jira status category."""
     flow = snapshots[snapshots["team"] == team_label].copy() if not snapshots.empty else snapshots.copy()
     if flow.empty:
-        st.info("Refresh Jira to save this team's first weekly flow snapshot.")
+        st.info("The daily simulation job or a Jira refresh will save this team's first flow snapshot.")
         return
 
     fig = px.area(
         flow,
-        x="week_start",
+        x="snapshot_date",
         y="items",
         color="status_category",
         title=f"{team_label} cumulative flow by status",
-        labels={"week_start": "Week of", "items": "Stories and bugs", "status_category": "Jira status"},
+        labels={"snapshot_date": "Date", "items": "Stories and bugs", "status_category": "Jira status"},
         category_orders={"status_category": ["To do", "In progress", "Done", "Other"]},
         color_discrete_map={
             "To do": "#E4A23A",
@@ -566,10 +1046,10 @@ def render_team_cumulative_flow(team_label: str, snapshots: pd.DataFrame) -> Non
         },
     )
     fig.update_layout(margin=dict(t=55, b=25, l=10, r=10), legend_title_text="Jira status")
-    fig.update_xaxes(title="Week of")
+    fig.update_xaxes(title="Date", tickformat="%b %d")
     st.plotly_chart(fig, use_container_width=True)
-    if flow["week_start"].nunique() == 1:
-        st.info("This is the first weekly snapshot. The trend will develop with Jira refreshes in later weeks.")
+    if flow["snapshot_date"].nunique() == 1:
+        st.info("One daily point is available so far. The simulator adds a point each day; Jira refreshes add today's latest counts.")
 
 
 def render_kpi_card(
@@ -599,18 +1079,30 @@ def render_kpi_card(
         st.markdown(card, unsafe_allow_html=True)
 
 
-def render_architecture_card(container, title: str, bullets: list[str], accent: str, background: str) -> None:
-    """Render one labeled block in a simple architecture flow."""
-    bullet_html = "".join(f"<li>{html_escape(item)}</li>" for item in bullets)
-    card = dedent(f"""
-    <div style="background:{background};border:1px solid #d7dee8;border-top:5px solid {accent};
-                border-radius:10px;padding:15px 17px;min-height:190px;box-sizing:border-box;">
-      <div style="font-size:1rem;font-weight:750;color:#172033;margin-bottom:8px;">{html_escape(title)}</div>
-      <ul style="margin:0;padding-left:18px;color:#475569;font-size:0.88rem;line-height:1.5;">{bullet_html}</ul>
-    </div>
+def render_workflow_lane(title: str, steps: list[str], accent: str) -> None:
+    """Render a concise horizontal workflow lane."""
+    nodes = []
+    for index, step in enumerate(steps):
+        nodes.append(
+            f"<div style='flex:1 1 150px;background:#fff;border:1px solid #d7dee8;"
+            f"border-left:4px solid {accent};border-radius:8px;padding:12px 14px;"
+            f"text-align:center;font-weight:650;color:#172033'>{html_escape(step)}</div>"
+        )
+        if index < len(steps) - 1:
+            nodes.append(
+                "<div style='flex:0 0 28px;text-align:center;align-self:center;"
+                "font-size:1.5rem;color:#64748b'>→</div>"
+            )
+    lane = dedent(f"""
+    <section style="margin:10px 0 22px;padding:16px 18px;background:#f8fafc;
+                    border:1px solid #e2e8f0;border-radius:12px;">
+      <div style="font-size:1rem;font-weight:750;color:#172033;margin-bottom:12px;">{html_escape(title)}</div>
+      <div style="display:flex;align-items:stretch;justify-content:center;gap:8px;flex-wrap:wrap;">
+        {''.join(nodes)}
+      </div>
+    </section>
     """).strip()
-    with container:
-        st.markdown(card, unsafe_allow_html=True)
+    st.markdown(lane, unsafe_allow_html=True)
 
 
 def render_bullet_box(container, title: str, bullets: list[str], accent: str, background: str) -> None:
@@ -660,11 +1152,15 @@ def render_unit_testing_velocity(
         breakdown_available = True
         actual_scope_rate = None
         actual_category_counts = {}
-        if "resolved" in work and (resolution_dates_available or work["resolved"].notna().any()):
-            now_utc = pd.Timestamp.now(tz="UTC")
+        completion_summary = build_delivery_summary(work, delivery_now, resolution_dates_available)
+        actual_scope_rate = completion_summary["completed_last_7_days"]
+        if actual_scope_rate is not None:
+            now_utc = delivery_now.tz_convert("UTC")
             last_week = now_utc - pd.Timedelta(days=7)
-            recent_resolved = work[work["resolved"].between(last_week, now_utc, inclusive="both")]
-            actual_scope_rate = float(len(recent_resolved))
+            recent_resolved = work[
+                work["status_category"].eq("Done")
+                & work["resolved"].between(last_week, now_utc, inclusive="both")
+            ]
             actual_category_counts = recent_resolved["work_category"].value_counts().to_dict()
     elif not weekly_snapshots.empty:
         latest = weekly_snapshots.sort_values("snapshot_date").iloc[-1]
@@ -698,7 +1194,7 @@ def render_unit_testing_velocity(
     if days_remaining == 0:
         st.warning("The milestone due date is today or has passed; the required weekly pace is no longer meaningful.")
     if not breakdown_available:
-        st.info("Showing total open work from the saved weekly snapshot. Refresh Jira to see category-level velocity.")
+        st.info("Showing total open work from the saved daily snapshot. Refresh Jira to see category-level velocity.")
 
     metric_cols = st.columns(3)
     metric_cols[0].metric("Open stories and bugs", f"{total_open:,}")
@@ -787,12 +1283,9 @@ with tabs[0]:
             "resolutiondate" in issue.get("fields", {}) for issue in raw_issues
         )
         if resolution_dates_available and not issues.empty:
-            now_utc = pd.Timestamp.now(tz="UTC")
-            last_week = now_utc - pd.Timedelta(days=7)
-            recent_work = issues[issues["issue_type"].str.casefold().isin(["story", "bug"])]
-            actual_scope_rate = float(
-                recent_work["resolved"].between(last_week, now_utc, inclusive="both").sum()
-            )
+            actual_scope_rate = build_delivery_summary(
+                issues, delivery_now, resolution_dates_available,
+            )["completed_last_7_days"]
         today = pd.Timestamp.now(tz="America/Los_Angeles").tz_localize(None).normalize()
         active_milestones = milestones[
             (milestones["start_date"] <= today) & (milestones["due_date"] >= today)
@@ -815,35 +1308,59 @@ with tabs[0]:
             if not active_milestones.empty
             else "No milestone is active today."
         )
+        scope_work = (
+            issues[issues["issue_type"].str.casefold().isin(["story", "bug"])].copy()
+            if not issues.empty
+            else pd.DataFrame()
+        )
+        team_member_count = (
+            scope_work.loc[
+                ~scope_work["assignee"].fillna("Unassigned").str.casefold().isin(["", "unassigned"]),
+                "assignee",
+            ].nunique()
+            if not issues.empty
+            else None
+        )
+        if not issues.empty:
+            scope_total = len(scope_work)
+            scope_closed = int((scope_work["status_category"] == "Done").sum())
+            scope_open = scope_total - scope_closed
+            jira_last_sync = st.session_state.get("jira_last_sync")
+            if jira_last_sync is not None:
+                sync_time = pd.Timestamp(jira_last_sync)
+                if sync_time.tzinfo is None:
+                    sync_time = sync_time.tz_localize("UTC")
+                scope_as_of = sync_time.tz_convert("America/Los_Angeles").strftime("%b %d, %Y %I:%M %p PT")
+            else:
+                scope_as_of = "latest Jira refresh"
+            scope_available = True
+        elif not weekly_snapshots.empty:
+            latest_snapshot = weekly_snapshots.sort_values("snapshot_date").iloc[-1]
+            scope_open = int(latest_snapshot["open_items"])
+            scope_closed = int(latest_snapshot["completed_items"])
+            scope_total = scope_open + scope_closed
+            scope_as_of = f"{latest_snapshot['snapshot_date']:%b %d, %Y} saved snapshot"
+            scope_available = True
+        else:
+            scope_total = scope_open = scope_closed = None
+            scope_as_of = "No Jira data available"
+            scope_available = False
+
         unit_test_rows = milestones[milestones["milestone"].str.casefold() == "unit testing validation"]
         planned_rate = None
         if not unit_test_rows.empty:
             unit_test_due = unit_test_rows.iloc[0]["due_date"].normalize()
-            if not weekly_snapshots.empty:
-                latest_snapshot = weekly_snapshots.sort_values("snapshot_date").iloc[-1]
-                open_scope = int(latest_snapshot["open_items"])
-                weeks_left = max(0, (unit_test_due - today).days) / 7
-                planned_rate = open_scope / weeks_left if weeks_left > 0 else None
-                planned_rate_label = f"{planned_rate:.1f}" if planned_rate is not None else "—"
-                actual_rate_label = f"{actual_scope_rate:.1f}" if actual_scope_rate is not None else "—"
-                if (
-                    planned_rate is not None
-                    and actual_scope_rate is not None
-                    and actual_scope_rate < planned_rate
-                    and schedule_status == "GREEN"
-                ):
-                    schedule_status, schedule_color, schedule_bg = "AMBER", "#B7791F", "#FFFBEB"
-                pace_detail = (
-                    f"Unit Testing by {unit_test_due:%b %d, %Y}: {planned_rate_label} planned / "
-                    f"{actual_rate_label} actual items per week."
-                )
-                if actual_scope_rate is None:
-                    pace_detail += " Refresh Jira for 7-day actual closures."
-            else:
-                pace_detail = f"Unit Testing due {unit_test_due:%b %d, %Y}; refresh Jira for scope and pace."
-        else:
-            pace_detail = "Unit Testing milestone is not defined."
-        schedule_detail = f"{active_detail}. {pace_detail}"
+            weeks_left = max(0, (unit_test_due - today).days) / 7
+            if scope_open is not None and weeks_left > 0:
+                planned_rate = scope_open / weeks_left
+            if (
+                planned_rate is not None
+                and actual_scope_rate is not None
+                and actual_scope_rate < planned_rate
+                and schedule_status == "GREEN"
+            ):
+                schedule_status, schedule_color, schedule_bg = "AMBER", "#B7791F", "#FFFBEB"
+        schedule_detail = active_detail
 
         if budget_total > PROGRAM_BUDGET_CAP_USD:
             cost_status, cost_color, cost_bg = "RED", "#B42318", "#FFF1F2"
@@ -890,22 +1407,17 @@ with tabs[0]:
     schedule_highlights = ["Milestone phases overlap as planned through October 2027."]
     if not unit_test_rows.empty:
         schedule_highlights.append(f"Unit testing validation is due {unit_test_due:%b %d, %Y}.")
-    if not weekly_snapshots.empty:
-        latest_snapshot = weekly_snapshots.sort_values("snapshot_date").iloc[-1]
-        snapshot_total = int(latest_snapshot["open_items"] + latest_snapshot["completed_items"])
+    if scope_available:
         schedule_highlights.append(
-            f"Latest Jira snapshot ({latest_snapshot['snapshot_date']:%b %d}) shows "
-            f"{int(latest_snapshot['completed_items']):,} of {snapshot_total:,} stories and bugs done."
+            f"{scope_closed:,} of {scope_total:,} Stories and Bugs are closed as of {scope_as_of}."
         )
     schedule_lowlights = []
     if not active_milestones.empty:
         schedule_lowlights.append(
             "; ".join(f"{row['milestone']} is {row['status']}" for _, row in active_milestones.iterrows()) + "."
         )
-    if actual_scope_rate is None:
-        schedule_lowlights.append("Seven-day Jira closure pace is unavailable; refresh Jira to capture actual velocity.")
-    elif planned_rate is not None and actual_scope_rate < planned_rate:
-        schedule_lowlights.append(f"Actual closure pace ({actual_scope_rate:.1f}/week) is below the {planned_rate:.1f}/week needed for Unit Testing.")
+    if actual_scope_rate is not None and planned_rate is not None and actual_scope_rate < planned_rate:
+        schedule_lowlights.append("Recent closure pace is below the level needed for Unit Testing Validation.")
     if not schedule_lowlights:
         schedule_lowlights.append("No schedule lowlights identified from current milestone and pace data.")
 
@@ -1015,110 +1527,244 @@ with tabs[0]:
     render_bullet_box(schedule_boxes[0], "Schedule highlights", schedule_highlights, "#16804A", "#ECFDF5")
     render_bullet_box(schedule_boxes[1], "Schedule lowlights", schedule_lowlights, "#B42318", "#FFF1F2")
 
-    st.subheader("Scope & Team Size (not including SOW partner)")
-    if issues.empty:
-        st.info("Connect and refresh Jira to load the current KAN backlog. Milestone details and charts are in Schedule Deep Dive.")
-        render_unit_testing_velocity(issues, weekly_snapshots, milestones, show_breakdown=False, resolution_dates_available=resolution_dates_available)
-    else:
-        metrics = st.columns(5)
-        assigned_work = issues[issues["issue_type"].str.casefold().isin(["story", "bug"])]
-        team_member_count = assigned_work.loc[
-            ~assigned_work["assignee"].fillna("Unassigned").str.casefold().isin(["", "unassigned"]),
-            "assignee",
-        ].nunique()
-        metrics[0].metric("Backlog stories", f"{summary['backlog_stories']:,}")
-        metrics[1].metric("Technical-debt stories", f"{summary['technical_debt_stories']:,}")
-        metrics[2].metric("Bugs", f"{summary['bugs']:,}")
-        metrics[3].metric("Open Jira items", f"{summary['open_items']:,}")
-        metrics[4].metric("Team members", f"{team_member_count:,}")
+    st.subheader("Scope & Team Size (excluding SOW partner)")
+    if scope_available:
+        _, scope_metrics_col, scope_chart_col, _ = st.columns([0.3, 1.35, 1.2, 0.3])
+        with scope_metrics_col:
+            scope_row_one = st.columns(2)
+            scope_row_one[0].metric("Stories + Bugs", f"{scope_total:,}")
+            scope_row_one[1].metric("Open", f"{scope_open:,}")
+            scope_row_two = st.columns(2)
+            scope_row_two[0].metric("Closed", f"{scope_closed:,}")
+            scope_row_two[1].metric("Team members", f"{team_member_count:,}" if team_member_count is not None else "—")
+            st.caption(f"Open means any Jira status outside Done · Data as of {scope_as_of}.")
+            if planned_rate is not None:
+                st.markdown(
+                    f"**Required average closure rate:** {planned_rate:.1f} Stories and Bugs per week "
+                    f"to meet Unit Testing Validation by {unit_test_due:%b %d, %Y}."
+                )
+            elif unit_test_rows.empty:
+                st.caption("Add the Unit Testing Validation milestone to calculate a required closure rate.")
+            elif scope_open is None:
+                st.caption("Refresh Jira to calculate the required closure rate.")
+            else:
+                st.caption(f"Unit Testing Validation is due {unit_test_due:%b %d, %Y}; the remaining time is insufficient to calculate a weekly rate.")
 
-        render_unit_testing_velocity(issues, weekly_snapshots, milestones, show_breakdown=False, resolution_dates_available=resolution_dates_available)
+        with scope_chart_col:
+            if scope_total > 0:
+                closure_pct = scope_closed / scope_total * 100
+                closure_chart = px.pie(
+                    pd.DataFrame({"Status": ["Open", "Closed"], "Items": [scope_open, scope_closed]}),
+                    names="Status",
+                    values="Items",
+                    hole=0.66,
+                    color="Status",
+                    color_discrete_map={"Open": "#3B82F6", "Closed": "#33A06F"},
+                    title="Backlog closure",
+                )
+                closure_chart.update_traces(
+                    textinfo="none",
+                    hovertemplate="%{label}<br>%{value:,.0f} items (%{percent})<extra></extra>",
+                )
+                closure_chart.add_annotation(
+                    text=f"{closure_pct:.0f}%<br>closed",
+                    x=0.5,
+                    y=0.5,
+                    showarrow=False,
+                    font=dict(size=18, color="#172033"),
+                )
+                closure_chart.update_layout(
+                    height=280,
+                    margin=dict(t=45, b=15, l=5, r=5),
+                    legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.05),
+                )
+                st.plotly_chart(closure_chart, use_container_width=True, key="program-summary-closure-donut")
+            else:
+                st.info("No Story or Bug items are in the current scope.")
+    else:
+        st.info("Connect and refresh Jira to show overall open-versus-closed scope and closure rate.")
+
+    render_program_priority_status(issues, scope_as_of)
+
+
+with tabs[7]:
+    st.header("Other Reports")
+    weekly_report_tab, daily_velocity_tab = st.tabs(["Weekly Program Readout", "Daily Velocity"])
+    with weekly_report_tab:
+        st.header("Weekly Program Readout")
+        st.caption("Create a local evidence-backed draft from the latest Jira snapshot, milestones, and financial actuals.")
+        with st.expander("Current priority and delivery context"):
+            st.caption("Current Jira context for review; saved readouts below retain their original report date.")
+            render_delivery_views(
+                issues, key_prefix="weekly-delivery", as_of=delivery_as_of,
+                resolution_dates_available=delivery_dates_available, now=delivery_now, compact=True,
+            )
+            render_forecast_summary(estimation_forecast)
+            if estimation_inputs["error"]:
+                st.warning(estimation_inputs["error"])
+        st.info("Target cadence: Friday, 4:00 PM Pacific. Drafts are saved locally for review; no Jira updates or external publishing are performed.")
+        if AI_PROVIDER == "ollama":
+            st.caption(f"Readout commentary uses a bounded draft-review-revise loop with local Ollama model {AI_MODEL}; calculated metrics and Jira evidence remain deterministic.")
+        elif AI_PROVIDER == "openai" and OPENAI_API_KEY:
+            st.caption(f"Readout commentary uses a bounded draft-review-revise loop with OpenAI model {AI_MODEL}; calculated metrics and Jira evidence remain deterministic.")
+        else:
+            st.caption("Model commentary is unavailable until [ai] provider and its credentials are configured; local fact-based drafts still work.")
+        readout_notice = st.session_state.pop("weekly_readout_notice", None)
+        if readout_notice:
+            notice_kind, notice_text = readout_notice
+            if notice_kind == "success":
+                st.success(notice_text)
+            else:
+                st.warning(notice_text)
+        if st.button("Generate weekly readout draft", type="primary", key="generate-weekly-readout"):
+            report_time = pd.Timestamp.now(tz="UTC")
+            estimation_reviewer = (make_estimation_reviewer(
+                AI_PROVIDER, AI_MODEL, api_key=OPENAI_API_KEY, base_url=OLLAMA_BASE_URL,
+            ) if AI_PROVIDER == "ollama" or (AI_PROVIDER == "openai" and OPENAI_API_KEY) else None)
+            with st.spinner("Simulating milestone scenarios and reviewing the evidence…"):
+                report_forecast = run_estimation_loop(
+                    issues, milestones, delivery_now, estimation_inputs=estimation_inputs,
+                    reviewer=estimation_reviewer,
+                )
+            readout_markdown = build_weekly_readout(
+                project_name=PROJECT_NAME,
+                project_key=configured_project,
+                generated_at=report_time,
+                issues=issues,
+                snapshots=weekly_snapshots,
+                milestones=milestones,
+                budget=budget,
+                actuals=recorded_actuals_to_date,
+                budget_cap=PROGRAM_BUDGET_CAP_USD,
+                overall_status=overall_value,
+                schedule_status=schedule_status,
+                cost_status=cost_status,
+                planned_rate=planned_rate,
+                actual_rate=actual_scope_rate,
+                estimation_inputs=estimation_inputs,
+                estimation_forecast=report_forecast,
+            )
+            if AI_PROVIDER == "ollama" or (AI_PROVIDER == "openai" and OPENAI_API_KEY):
+                try:
+                    with st.spinner("Drafting commentary, checking risk coverage, and revising if needed…"):
+                        commentary_result = generate_configured_commentary(
+                            AI_PROVIDER,
+                            AI_MODEL,
+                            readout_markdown,
+                            api_key=OPENAI_API_KEY,
+                            base_url=OLLAMA_BASE_URL,
+                        )
+                    marker = "## Executive status"
+                    readout_markdown = readout_markdown.replace(
+                        marker,
+                        f"## AI-reviewed executive commentary ({AI_PROVIDER}: {AI_MODEL})\n\n"
+                        f"*Coverage/risk checks: {commentary_result.review_passes}; "
+                        f"revisions: {commentary_result.revisions}.*\n\n"
+                        f"{commentary_result.text}\n\n{marker}",
+                        1,
+                    )
+                    st.session_state["weekly_readout_notice"] = (
+                        "success",
+                        "AI commentary passed the coverage and evidence review "
+                        f"({commentary_result.review_passes} review pass(es), "
+                        f"{commentary_result.revisions} revision(s)).",
+                    )
+                except ReadoutModelError as exc:
+                    st.session_state["weekly_readout_notice"] = (
+                        "warning",
+                        f"AI commentary was unavailable; saved a fact-based draft. {exc}",
+                    )
+            else:
+                st.session_state["weekly_readout_notice"] = (
+                    "warning",
+                    "Model commentary is not configured; saved a fact-based draft.",
+                )
+            READOUTS_DIR.mkdir(parents=True, exist_ok=True)
+            readout_path = READOUTS_DIR / f"weekly_readout_{report_time.tz_convert('America/Los_Angeles'):%Y%m%d_%H%M%S}.md"
+            readout_path.write_text(readout_markdown, encoding="utf-8")
+            save_forecast_run(
+                readout_path.with_suffix(".forecast.json"), report_forecast,
+                issues=issues, milestones=milestones, now=delivery_now, estimation_inputs=estimation_inputs,
+            )
+            st.rerun()
+
+        readout_files = sorted(READOUTS_DIR.glob("weekly_readout_*.md"), reverse=True) if READOUTS_DIR.exists() else []
+        if readout_files:
+            selected_readout = st.selectbox(
+                "Saved drafts",
+                options=readout_files,
+                format_func=lambda path: path.stem.replace("weekly_readout_", ""),
+                key="weekly-readout-selector",
+            )
+            stale_readout = False
+            source_files = [
+                ("Jira snapshot", SNAPSHOTS_FILE),
+                ("milestones.csv", MILESTONES_FILE),
+                ("program_budget.csv", BUDGET_FILE),
+                ("program_actuals.csv", ACTUALS_FILE),
+                ("estimation inputs", ESTIMATION_INPUTS_FILE),
+            ]
+            source_updates = [
+                (path.stat().st_mtime, label)
+                for label, path in source_files
+                if path.exists()
+            ]
+            if source_updates:
+                latest_source_mtime, latest_source_label = max(source_updates)
+                if latest_source_mtime > selected_readout.stat().st_mtime + 1:
+                    stale_readout = True
+                    latest_source_time = pd.Timestamp(latest_source_mtime, unit="s", tz="UTC").tz_convert(
+                        "America/Los_Angeles"
+                    )
+                    st.warning(
+                        f"This saved draft predates the latest {latest_source_label} update "
+                        f"({latest_source_time:%b %d, %Y %I:%M %p} PT). It is shown as historical; "
+                        "generate a new draft to use current source data."
+                    )
+            readout_text = selected_readout.read_text(encoding="utf-8")
+            forecast_path = selected_readout.with_suffix(".forecast.json")
+            if forecast_path.exists():
+                st.download_button(
+                    "Download forecast inputs and diagnostics", data=forecast_path.read_bytes(),
+                    file_name=forecast_path.name, mime="application/json", key="download-forecast-run",
+                )
+            if "**Projected backlog closure against Unit testing validation:**" in readout_text:
+                st.warning(
+                    "This historical draft uses a retired item-count closure forecast. Its predicted date "
+                    "does not account for story-point effort, dependencies, or validation work. "
+                    "Generate a new draft for the effort-based milestone outlook."
+                )
+            if stale_readout:
+                st.markdown("#### Current milestone status from `milestones.csv`")
+                current_milestones = milestones[["milestone", "status", "due_date"]].copy()
+                current_milestones["due_date"] = pd.to_datetime(
+                    current_milestones["due_date"], errors="coerce"
+                ).dt.strftime("%b %d, %Y")
+                current_milestones = current_milestones.rename(columns={
+                    "milestone": "Milestone",
+                    "status": "Current status",
+                    "due_date": "Due",
+                })
+                st.dataframe(current_milestones, use_container_width=True, hide_index=True)
+                with st.expander("View saved point-in-time draft (may contain older statuses)"):
+                    st.markdown(readout_text)
+            else:
+                st.markdown(readout_text)
+            st.download_button(
+                "Download this readout",
+                data=readout_text,
+                file_name=selected_readout.name,
+                mime="text/markdown",
+                key="download-weekly-readout",
+            )
+        else:
+            st.info("No saved readouts yet. Generate a draft to begin the review history.")
+
+    with daily_velocity_tab:
+        render_daily_velocity_page()
 
 
 with tabs[1]:
-    st.header("Weekly Program Readout")
-    st.caption("Create a local evidence-backed draft from the latest Jira snapshot, milestones, and financial actuals.")
-    st.info("Target cadence: Friday, 4:00 PM Pacific. Drafts are saved locally for review; no Jira updates or external publishing are performed.")
-    if OPENAI_API_KEY:
-        st.caption(f"AI commentary is enabled with {OPENAI_MODEL}; calculated metrics and Jira evidence remain deterministic.")
-    else:
-        st.caption("OpenAI commentary is not configured. Add an API key under [openai] in .streamlit/secrets.toml to enable it; local fact-based drafts still work.")
-    readout_notice = st.session_state.pop("weekly_readout_notice", None)
-    if readout_notice:
-        notice_kind, notice_text = readout_notice
-        if notice_kind == "success":
-            st.success(notice_text)
-        else:
-            st.warning(notice_text)
-    if st.button("Generate weekly readout draft", type="primary", key="generate-weekly-readout"):
-        report_time = pd.Timestamp.now(tz="UTC")
-        readout_markdown = build_weekly_readout(
-            project_name=PROJECT_NAME,
-            project_key=configured_project,
-            generated_at=report_time,
-            issues=issues,
-            snapshots=weekly_snapshots,
-            milestones=milestones,
-            budget=budget,
-            actuals=recorded_actuals_to_date,
-            budget_cap=PROGRAM_BUDGET_CAP_USD,
-            overall_status=overall_value,
-            schedule_status=schedule_status,
-            cost_status=cost_status,
-            planned_rate=planned_rate,
-            actual_rate=actual_scope_rate,
-        )
-        if OPENAI_API_KEY:
-            try:
-                with st.spinner("Drafting executive commentary from the verified report facts…"):
-                    commentary = generate_ai_commentary(OPENAI_API_KEY, OPENAI_MODEL, readout_markdown)
-                marker = "## Executive status"
-                readout_markdown = readout_markdown.replace(
-                    marker,
-                    f"## AI-generated executive commentary\n\n{commentary}\n\n{marker}",
-                    1,
-                )
-                st.session_state["weekly_readout_notice"] = (
-                    "success",
-                    "AI commentary was generated successfully for this draft.",
-                )
-            except OpenAIReadoutError as exc:
-                st.session_state["weekly_readout_notice"] = (
-                    "warning",
-                    f"AI commentary was unavailable; saved a fact-based draft. {exc}",
-                )
-        else:
-            st.session_state["weekly_readout_notice"] = (
-                "warning",
-                "OpenAI commentary is not configured; saved a fact-based draft.",
-            )
-        READOUTS_DIR.mkdir(parents=True, exist_ok=True)
-        readout_path = READOUTS_DIR / f"weekly_readout_{report_time.tz_convert('America/Los_Angeles'):%Y%m%d_%H%M%S}.md"
-        readout_path.write_text(readout_markdown, encoding="utf-8")
-        st.rerun()
-
-    readout_files = sorted(READOUTS_DIR.glob("weekly_readout_*.md"), reverse=True) if READOUTS_DIR.exists() else []
-    if readout_files:
-        selected_readout = st.selectbox(
-            "Saved drafts",
-            options=readout_files,
-            format_func=lambda path: path.stem.replace("weekly_readout_", ""),
-            key="weekly-readout-selector",
-        )
-        readout_text = selected_readout.read_text(encoding="utf-8")
-        st.markdown(readout_text)
-        st.download_button(
-            "Download this readout",
-            data=readout_text,
-            file_name=selected_readout.name,
-            mime="text/markdown",
-            key="download-weekly-readout",
-        )
-    else:
-        st.info("No saved readouts yet. Generate a draft to begin the review history.")
-
-
-with tabs[2]:
     st.subheader("Schedule Deep Dive")
     st.caption("Milestone timing, scope pace, work category breakdowns, and Jira trend charts.")
     st.subheader("Program timeline · Sep 2026–Oct 2027")
@@ -1144,6 +1790,17 @@ with tabs[2]:
         st.info("No milestones are defined in milestones.csv.")
 
     render_unit_testing_velocity(issues, weekly_snapshots, milestones, show_breakdown=True, resolution_dates_available=resolution_dates_available)
+    target_due = unit_test_rows.iloc[0]["due_date"] if not unit_test_rows.empty else None
+    render_delivery_views(
+        issues, key_prefix="schedule-delivery", as_of=delivery_as_of,
+        resolution_dates_available=delivery_dates_available, now=delivery_now,
+        milestone_due=target_due, show_effort_outlook=True,
+        scope_note="Program scope: current KAN Stories and Bugs across all workstreams.",
+    )
+    render_estimation_readiness(estimation_readiness, key_prefix="schedule-estimation")
+    render_estimation_forecast(estimation_forecast, key_prefix="schedule-forecast")
+    if estimation_inputs["error"]:
+        st.warning(estimation_inputs["error"])
     if not issues.empty:
         st.subheader("Jira work charts")
         chart_left, chart_right = st.columns(2)
@@ -1159,12 +1816,12 @@ with tabs[2]:
         st.subheader("Work category breakdown")
         render_work_category_table(issues)
     st.subheader("Daily work trend")
-    st.caption("Each Jira refresh now records daily open and completed counts. Earlier weekly snapshots remain at their recorded dates.")
+    st.caption("The daily simulator and each Jira refresh record open and completed counts, building a daily trend across the program.")
     render_work_trend_chart(weekly_snapshots)
 
 
 
-with tabs[3]:
+with tabs[2]:
     st.header("Budget Breakdown")
     st.caption("Planned allocation and recorded actual spend by budget component · USD")
     budget_summary_cols = st.columns(3)
@@ -1180,6 +1837,11 @@ with tabs[3]:
     )
     st.caption(
         f"Approved program cap: ${PROGRAM_BUDGET_CAP_USD:,.0f}. Remaining allocation subtracts all actuals recorded to date from the current component allocation plan."
+    )
+    render_delivery_views(
+        issues, key_prefix="budget-delivery", as_of=delivery_as_of,
+        resolution_dates_available=delivery_dates_available, now=delivery_now, compact=True,
+        scope_note="Program-wide delivery context. Jira priority and pace do not determine actual spend or cost variance.",
     )
 
     actual_by_component = (
@@ -1305,122 +1967,130 @@ def render_team_page(team_label: str, epic_key: str) -> None:
     metric_cols[0].metric("Backlog stories", f"{story_count:,}")
     metric_cols[1].metric("Technical-debt stories", f"{debt_count:,}")
     metric_cols[2].metric("Bugs", f"{bug_count:,}")
-    left, right = st.columns(2)
-    with left:
-        render_status_chart(team_frame, f"{team_label}: stories and bugs by status")
-    with right:
-        render_priority_chart(team_frame, f"{team_label}: items by priority")
+    render_status_chart(team_frame, f"{team_label}: stories and bugs by status")
+    render_delivery_views(
+        team_frame, key_prefix=f"team-{team_value}-delivery", as_of=delivery_as_of,
+        resolution_dates_available=delivery_dates_available, now=delivery_now,
+        scope_note=(f"{team_label} page scope: workstream backlog and technical debt linked to {epic_key}. "
+                    "Historical completion counts use the current page membership, not team ownership at completion."),
+    )
     st.subheader(f"{team_label} resource to story/bug mapping")
     st.markdown(f"Epic: [{epic_key}](https://vishala-ai.atlassian.net/browse/{epic_key})")
     st.caption("Unassigned stories and bugs are included so resourcing gaps remain visible.")
     render_resource_work_mapping(team_frame, team_label)
     st.subheader(f"{team_label} cumulative flow")
-    st.caption("Weekly snapshots show story and bug counts across Jira status categories. Refresh Jira each week to build the trend.")
-    render_team_cumulative_flow(team_label, weekly_team_flow)
+    st.caption("Daily snapshots show story and bug counts across Jira status categories. The simulation job records daily counts and issue-level state; a Jira refresh replaces today's snapshot with the latest Jira data.")
+    render_team_cumulative_flow(team_label, daily_team_flow)
 
 
-with tabs[4]:
+with tabs[3]:
     st.subheader("Finance & Accounting")
     render_team_page("Finance & Accounting", EPICS["Finance & Accounting"])
 
-with tabs[5]:
+with tabs[4]:
     st.subheader("Credit")
     render_team_page("Credit", EPICS["Credit"])
 
-with tabs[6]:
+with tabs[5]:
     st.subheader("Collections")
     render_team_page("Collection", EPICS["Collection"])
 
-with tabs[7]:
-    st.subheader("Conceptual migration architecture · TD user groups to GCP")
-    st.caption(
-        "Illustrative program view based on the migration scope. Confirm the current TD identity source, "
-        "GCP target services, provisioning method, and security controls with the architecture team."
+with tabs[6]:
+    st.header("PT-app Workflows")
+    st.caption("Three connected workflows: refresh Jira data, produce weekly readouts, and build simulated delivery history.")
+    st.caption("While open, local CSV/Markdown edits rerender the dashboard within 60 seconds. A new simulator snapshot also triggers a read-only Jira fetch; other direct Jira edits need a manual refresh.")
+    st.caption("Python calculates conditional simulated Unit testing scenarios and checks their consistency. Weekly draft generation adds an AI evidence critic with one permitted trial-count increase, followed by a separate commentary review with one revision. Rejected forecasts withhold dates; unavailable reviewers leave valid simulations labeled unreviewed. Commentary failures retain the fact-based report.")
+
+    st.subheader("How data flows across dashboard pages")
+    st.caption("Each tab is an independent view over shared sources. Arrows show the data and workflow inputs that feed each page.")
+    st.graphviz_chart(
+        r'''digraph PTAppPageFlows {
+            graph [rankdir=TB, bgcolor="transparent", pad="0.18", nodesep="0.28", ranksep="0.48", fontname="Arial", fontsize=10];
+            node [shape=box, style="rounded,filled", color="#CBD5E1", fillcolor="#F8FAFC", fontname="Arial", fontsize=10, margin="0.14,0.09"];
+            edge [color="#64748B", arrowsize=0.7, penwidth=1.15];
+
+            jira [label="Jira KAN\nStatus · priority · estimates · resolution dates", fillcolor="#EAF2FF", color="#93B4E8"];
+            local [label="Program files\nMilestones · budget · actuals · estimation inputs", fillcolor="#FFF7E6", color="#E8BD69"];
+            snaps [label="Daily snapshots\nIssue changes · team flow", fillcolor="#ECFDF3", color="#81C99B"];
+            calc [label="Prepare program data\nClassify work · priority risks · completion pace", fillcolor="#F1F5F9", color="#94A3B8"];
+            workflows [label="Application workflows\nRefresh · reporting · simulation", fillcolor="#F5F3FF", color="#B7A5E8"];
+            summary [label="Program Summary"];
+            schedule [label="Schedule Deep Dive"];
+            budget [label="Budget Breakdown"];
+            finance [label="Finance & Accounting"];
+            credit [label="Credit"];
+            collections [label="Collections"];
+            daily [label="Other Reports\nDaily Velocity"];
+            weekly [label="Other Reports\nWeekly Readout"];
+            architecture [label="Architecture\nWorkflow reference", fillcolor="#F5F3FF", color="#B7A5E8"];
+            simulation [label="Independent daily\nsimulation job", fillcolor="#FFF7E6", color="#E8BD69"];
+            forecast [label="Python conditional simulation\nEffort · growth · 91% Done · consistency checks", fillcolor="#FFF7E6", color="#E8BD69"];
+            ai [label="AI forecast critic + commentary review\nWeekly draft generation only", fillcolor="#ECFDF3", color="#81C99B"];
+
+            { rank=same; jira; local; snaps; }
+            jira -> calc;
+            local -> calc;
+            snaps -> calc;
+            calc -> summary;
+            calc -> schedule;
+            calc -> forecast;
+            forecast -> schedule [label="unreviewed preview"];
+            forecast -> weekly [label="conditional scenarios"];
+            calc -> budget [label="delivery context"];
+            local -> budget [label="budget + actuals"];
+            jira -> finance;
+            jira -> credit;
+            jira -> collections;
+            jira -> daily;
+            jira -> weekly;
+            snaps -> finance [label="flow"];
+            snaps -> credit [label="flow"];
+            snaps -> collections [label="flow"];
+            snaps -> daily;
+            snaps -> weekly;
+            local -> weekly;
+            calc -> weekly;
+            weekly -> ai;
+            ai -> weekly [label="review / fallback"];
+            simulation -> jira [style=dashed, color="#C9821A", label="labeled transitions"];
+            simulation -> snaps [style=dashed, color="#C9821A", label="save snapshot"];
+            workflows -> architecture;
+        }''',
+        use_container_width=True,
     )
-    source_col, source_arrow, mapping_col, mapping_arrow, target_col = st.columns([1, 0.15, 1, 0.15, 1])
-    render_architecture_card(
-        source_col,
-        "TD source",
-        ["User groups and membership", "Current access and ownership inventory", "Source of record to confirm"],
-        "#64748B",
-        "#F1F5F9",
-    )
-    with source_arrow:
-        st.markdown("<div style='font-size:2rem;text-align:center;padding-top:70px;color:#64748B'>→</div>", unsafe_allow_html=True)
-    render_architecture_card(
-        mapping_col,
-        "Migration control",
-        ["Inventory and map groups to target access", "Owner/security approval before provisioning", "Reconcile migrated membership and exceptions"],
+
+    render_workflow_lane(
+        "1 · Daily Jira refresh",
+        ["Jira KAN", "Manual / snapshot trigger", "Fetch + normalize + snapshot", "Program + team views"],
         "#3B82F6",
-        "#EFF6FF",
     )
-    with mapping_arrow:
-        st.markdown("<div style='font-size:2rem;text-align:center;padding-top:70px;color:#64748B'>→</div>", unsafe_allow_html=True)
-    render_architecture_card(
-        target_col,
-        "GCP target",
-        ["Cloud Identity / Google Groups (proposed)", "IAM role bindings at approved folders/projects", "Audit and access verification"],
+    render_workflow_lane(
+        "2 · Weekly readout · Friday, 4 PM PT",
+        ["Jira + scenario inputs", "Python + model checks", "Forecast critic / one rerun", "Report + commentary review", "Save inputs + draft", "Human review"],
         "#33A06F",
-        "#ECFDF5",
     )
-
-    st.markdown(" ")
-    validation_col, operations_col = st.columns(2)
-    render_architecture_card(
-        validation_col,
-        "Validation and business UAT",
-        ["Validate membership and effective access", "Finance & Accounting, Credit, and Collections sign-off", "Track defects and reconcile exceptions"],
+    st.markdown(
+        "<div style='margin:-12px 0 20px;padding:10px 14px;border-left:4px solid #33A06F;"
+        "background:#f0fdf4;border-radius:6px;color:#166534;font-size:0.9rem'>"
+        "↶ The forecast critic can request one increase in trials; it cannot edit dates or business assumptions. "
+        "The separate commentary loop permits one revision. Failed reviews retain the fact-based report.</div>",
+        unsafe_allow_html=True,
+    )
+    render_workflow_lane(
+        "3 · Simulation foundation · daily, 4 PM PT",
+        ["KAN scope + 91% target", "Plan status moves", "Update Jira", "Audit + snapshots", "Daily / weekly trends"],
         "#E4A23A",
-        "#FFFBEB",
     )
-    render_architecture_card(
-        operations_col,
-        "Production parallel and hypercare",
-        ["Monitor access and migration results", "Support team handles incidents and rollback decisions", "Cut over after agreed exit criteria"],
-        "#8B6FB0",
-        "#F5F0FA",
-    )
-    st.info("Cross-cutting design areas: identity governance, least privilege, auditability, platform readiness, and technical-debt remediation.")
-
-    st.divider()
-    st.subheader("PT-app workflow · Jira to weekly readout")
-    st.caption("End-to-end flow through the application. AI narration is optional; the metrics and saved draft remain usable without it.")
-    flow_cols = st.columns([1, 0.14, 1, 0.14, 1, 0.14, 1])
-    render_architecture_card(
-        flow_cols[0],
-        "1 · Inputs",
-        ["Jira Cloud KAN via read-only OAuth", "Milestones, budget, and actuals from local CSV files"],
-        "#38598B",
-        "#EFF6FF",
-    )
-    with flow_cols[1]:
-        st.markdown("<div style='font-size:2rem;text-align:center;padding-top:70px;color:#64748B'>→</div>", unsafe_allow_html=True)
-    render_architecture_card(
-        flow_cols[2],
-        "2 · Prepare data",
-        ["Fetch and normalize Jira issues", "Classify teams and technical-debt stories", "Record local trend snapshots"],
-        "#0F9D9A",
-        "#ECFEFF",
-    )
-    with flow_cols[3]:
-        st.markdown("<div style='font-size:2rem;text-align:center;padding-top:70px;color:#64748B'>→</div>", unsafe_allow_html=True)
-    render_architecture_card(
-        flow_cols[4],
-        "3 · Analyze and display",
-        ["Calculate scope, schedule, and cost status", "Render program, workstream, budget, and architecture views"],
-        "#8B6FB0",
-        "#F5F0FA",
-    )
-    with flow_cols[5]:
-        st.markdown("<div style='font-size:2rem;text-align:center;padding-top:70px;color:#64748B'>→</div>", unsafe_allow_html=True)
-    render_architecture_card(
-        flow_cols[6],
-        "4 · Draft and review",
-        ["Build a deterministic report with metrics and Jira evidence", "Add OpenAI commentary when API access and credits are available", "Save a local Markdown draft for human review; no Jira writes"],
-        "#E4A23A",
-        "#FFFBEB",
-    )
-    st.info("No-API option: download the fact-based readout and paste it into ChatGPT Pro for manual narrative help. That handoff happens outside PT-app.")
+    st.subheader("Priority and velocity across pages")
+    st.caption("Program Summary shows status by priority and a Complexity/Effort pie of Story counts by estimate under Schedule overview. Other pages tailor delivery detail to their scope.")
+    st.table(pd.DataFrame([
+        {"View": "Open-work priority", "Source and meaning": "Current Story/Bug priority and status. High/Highest items are highlighted; overdue means an open item's due date is before the Pacific date of the Jira refresh."},
+        {"View": "Completion velocity", "Source and meaning": "Current Done Stories/Bugs grouped by Jira resolution date into consecutive trailing 7-day windows ending at the last Jira refresh. Counts are items, not story points."},
+        {"View": "Priority changes", "Source and meaning": "Daily issue snapshots reveal net priority changes. Changes made and reversed between snapshots are not visible."},
+        {"View": "Effort-based milestone outlook", "Source and meaning": "Schedule Deep Dive shows known remaining story points, estimate coverage, workstream effort and observed completed points. Weekly Readout keeps a compact earliest/latest modeled completion summary and brief assumptions, with a note directing readers to Schedule Deep Dive. Milestone dates remain planned targets; current item or point throughput alone does not establish a finish date."},
+        {"View": "Conditional simulated Unit testing forecast", "Source and meaning": "Workstream effort budgets, 0/10/25% future-scope sensitivities, priority/effort selection policies and the 91% Done item threshold produce conditional model dates and trial fractions. UAT and overall closure are separate; results are not real delivery confidence. Ordinary previews do not call AI."},
+        {"View": "Real-delivery estimation readiness", "Source and meaning": "Checks estimate and history coverage, real versus simulated data, milestone scope, dependencies, capacity, remaining work, testing and model validation. Shows evidence, owner or role and next step. Simulated forecasts do not clear these real-delivery evidence gaps."},
+    ]))
 
 st.divider()
-st.caption("Read-only dashboard · Jira statuses and counts reflect the latest successful refresh.")
+st.caption("Dashboard pages do not write to Jira. Daily Velocity compares saved issue snapshots to show net changes between days; other Jira views reflect the latest successful refresh.")

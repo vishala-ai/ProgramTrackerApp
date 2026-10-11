@@ -1,0 +1,58 @@
+{
+  "project_key": "KAN",
+  "data_mode": "simulation",
+  "milestone_scenario": {
+    "target_completion_pct": 91,
+    "scope_growth_until": "2026-10-30"
+  },
+  "confirmations": {
+    "milestone_scope": {
+      "confirmed": false,
+      "evidence": "",
+      "owner": "TPM and testing lead"
+    },
+    "dependencies": {
+      "confirmed": false,
+      "evidence": "",
+      "owner": "Workstream leads"
+    },
+    "capacity": {
+      "confirmed": false,
+      "evidence": "",
+      "owner": "Engineering managers"
+    },
+    "remaining_work": {
+      "confirmed": false,
+      "evidence": "",
+      "owner": "Story owners and workstream leads"
+    },
+    "testing_rework": {
+      "confirmed": false,
+      "evidence": "",
+      "owner": "Testing lead"
+    },
+    "history_representative": {
+      "confirmed": false,
+      "evidence": "",
+      "owner": "TPM and workstream leads"
+    },
+    "model_validation": {
+      "confirmed": false,
+      "evidence": "",
+      "owner": "Future model validation and backtest plan owner"
+    }
+  },
+  "forecast": {
+    "enabled": false,
+    "seed": 20261011,
+    "trials": 400,
+    "horizon_weeks": 156,
+    "growth_fractions": [
+      0,
+      0.1,
+      0.25
+    ],
+    "weekly_capacity_cv": 0.35,
+    "fallback_points_per_person_week": 8
+  }
+}

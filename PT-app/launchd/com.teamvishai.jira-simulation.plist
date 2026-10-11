@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>__PYVENV_LAUNCHER__</key>
+		<string>/Users/vishalakosaraju/Desktop/ai-learning/PT-app/.venv/bin/python</string>
+	</dict>
+	<key>Label</key>
+	<string>com.teamvishai.jira-simulation</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python</string>
+		<string>/Users/vishalakosaraju/Desktop/ai-learning/PT-app/jira_simulation_job.py</string>
+		<string>--apply</string>
+		<string>--max-transitions</string>
+		<string>5</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/vishalakosaraju/Desktop/ai-learning/PT-app/data/jira_simulation/jira_simulation_job.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/vishalakosaraju/Desktop/ai-learning/PT-app/data/jira_simulation/jira_simulation_job.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>16</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/vishalakosaraju/Desktop/ai-learning/PT-app</string>
+</dict>
+</plist>
